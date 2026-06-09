@@ -65,6 +65,11 @@ def pbmc_cytokines(
         **kwargs,
     )
 
+def test(force_download: bool = False,
+    **kwargs: Any,
+)-> ad.AnnData:
+    return _load_dataset(filename="test.h5ad", force_download=force_download, **kwargs)
+
 
 def zesta(
     force_download: bool = False,
