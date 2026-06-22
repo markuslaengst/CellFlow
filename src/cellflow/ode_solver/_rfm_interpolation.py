@@ -1,5 +1,5 @@
 from cellflow.preprocessing._premetric import SpectralNystroem
-import jax.numpy as np
+import jax.numpy as jnp
 
 
 class RFMInterpolation:
@@ -18,22 +18,9 @@ class RFMInterpolation:
         return xt
 
     def u_t(self, xt, x1):
+        d, grad_d, g = self.nystroem.distance_grad_and_norm_batch(xt, x1)
 
-        # ----- spectral squared distance -----
-        d2 = self.nystroem.spectral_distance(xt, x1)
-        d = np.sqrt(d2 + 1e-12)
-
-        # ----- gradient of squared distance -----
-        grad_d2 = self.nystroem.spectral_distance_grad(xt, x1)
-
-        # convert to gradient of distance
-        grad_d = grad_d2 / (2.0 * d + 1e-12)
-
-        # ----- Riemannian norm term -----
-        g = self.nystroem.g_norm_fast(xt, x1) + 1e-12
-
-        # ----- RFM vector field -----
-        u_t = - (d * grad_d) / g
+        u_t = -(d[:, None] * grad_d) / g[:, None]
 
         return u_t
 

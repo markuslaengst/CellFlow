@@ -1,5 +1,6 @@
 import numpy as np
 import jax.numpy as jnp
+import jax
 from sklearn.neighbors import NearestNeighbors
 from scipy.sparse import coo_matrix, diags
 from scipy.sparse.linalg import lobpcg
@@ -8,22 +9,81 @@ from scipy.sparse.linalg import lobpcg
 # ---------------------------
 # kNN graph construction
 # ---------------------------
-def build_knn_graph(X, k=30, sigma=None):
+def build_knn_graph(X, k=30, sigma=None, symmetrize="max", remove_self=True):
+    """
+    Build a weighted kNN graph using a Gaussian kernel.
+
+    Parameters
+    ----------
+    X : array, shape (n, d)
+        Input data.
+
+    k : int
+        Number of non-self nearest neighbors.
+
+    sigma : float or None
+        Gaussian kernel bandwidth. If None, uses median non-self kNN distance.
+
+    symmetrize : {"max", "mean", None}
+        How to make the graph symmetric.
+        - "max":  W = max(W, W.T)
+        - "mean": W = 0.5 * (W + W.T)
+        - None: keep directed kNN graph
+
+    remove_self : bool
+        Whether to remove self-neighbors / diagonal entries.
+
+    Returns
+    -------
+    W : scipy.sparse.csr_matrix, shape (n, n)
+        Weighted adjacency matrix.
+
+    sigma : float
+        Gaussian bandwidth used.
+    """
+
     n = X.shape[0]
-    nn = NearestNeighbors(n_neighbors=k).fit(X)
+
+    if remove_self:
+        n_neighbors = k + 1
+    else:
+        n_neighbors = k
+
+    nn = NearestNeighbors(n_neighbors=n_neighbors).fit(X)
     dist, ind = nn.kneighbors(X)
 
-    rows = np.repeat(np.arange(n), k)
-    cols = ind.flatten()
+    if remove_self:
+        # Usually the first neighbor is the point itself.
+        # This removes the zero-distance self-neighbor.
+        dist = dist[:, 1:]
+        ind = ind[:, 1:]
 
     if sigma is None:
         sigma = np.median(dist)
 
-    # NOTE: consistent Gaussian kernel convention
-    weights = np.exp(-(dist**2) / (2 * sigma**2)).flatten()
+    if sigma <= 0:
+        raise ValueError(f"sigma must be positive, got sigma={sigma}")
 
-    W = coo_matrix((weights, (rows, cols)), shape=(n, n))
-    W = 0.5 * (W + W.T)
+    rows = np.repeat(np.arange(n), dist.shape[1])
+    cols = ind.ravel()
+
+    weights = np.exp(-(dist.ravel() ** 2) / (2.0 * sigma**2))
+
+    W = coo_matrix((weights, (rows, cols)), shape=(n, n)).tocsr()
+
+    if symmetrize == "max":
+        W = W.maximum(W.T)
+    elif symmetrize == "mean":
+        W = 0.5 * (W + W.T)
+    elif symmetrize is None:
+        pass
+    else:
+        raise ValueError("symmetrize must be one of {'max', 'mean', None}")
+
+    if remove_self:
+        W.setdiag(0.0)
+        W.eliminate_zeros()
+
     return W.tocsr(), sigma
 
 
@@ -101,9 +161,7 @@ class SpectralNystroem:
     # Nyström extension
     # ---------------------------
     def embed_point(self, x):
-        # Compute k-NN ids
         d2 = jnp.sum((self.X - x) ** 2, axis=1)
-
         idx = jnp.argsort(d2)[:self.k]
 
         Xn = self.X[idx]
@@ -111,14 +169,7 @@ class SpectralNystroem:
 
         K = self._kernel(x, Xn)
 
-        m = self.Phi.shape[1]
-        phi_x = jnp.zeros(m)
-
-        for i in range(m):
-            lam_i = self.lam[i] + 1e-12
-            phi_x.at[i].set((1.0 / lam_i) * jnp.sum(K * Phin[:, i]))
-
-        return phi_x
+        return jnp.sum(K[:, None] * Phin, axis=0) / (self.lam + 1e-12)
 
 
     # ---------------------------
@@ -134,40 +185,26 @@ class SpectralNystroem:
     # GRADIENT w.r.t. x
     # =====================================================
     def spectral_distance_grad(self, x, y):
-
         phi_x = self.embed_point(x)
         phi_y = self.embed_point(y)
 
-        # Compute k-NN ids
         d2 = jnp.sum((self.X - x) ** 2, axis=1)
-
         idx = jnp.argsort(d2)[:self.k]
 
-        Xn = self.X[idx]
-        Phin = self.Phi[idx]
+        Xn = self.X[idx]  # (k, d)
+        Phin = self.Phi[idx]  # (k, m)
 
-        diff = x[None, :] - Xn
-        dist2 = jnp.sum(diff**2, axis=1)
+        diff = Xn - x[None, :]  # (k, d)
+        dist2 = jnp.sum(diff ** 2, axis=1)
 
-        K = jnp.exp(-dist2 / (2 * self.sigma**2))
+        K = jnp.exp(-dist2 / (2.0 * self.sigma ** 2))  # (k,)
 
-        grad = jnp.zeros_like(x)
+        coeff = 2.0 * (phi_x - phi_y) / (self.lam + 1e-12)  # (m,)
 
-        # precompute kernel-weighted directional sums
-        for i in range(self.Phi.shape[1]):
+        # A[a] = sum_i Phin[a, i] * coeff[i]
+        A = Phin @ coeff  # (k,)
 
-            lam_i = self.lam[i] + 1e-12
-            coeff = 2.0 * (phi_x[i] - phi_y[i]) / lam_i
-
-            # ∑ K(x,xj) φ_i(xj) (xj - x)
-            s = jnp.sum(
-                (K * Phin[:, i])[:, None] * (Xn - x[None, :]),
-                axis=0
-            )
-
-            grad = grad + coeff * s
-
-        grad = grad * 1.0 / (self.sigma**2)
+        grad = jnp.sum((K * A)[:, None] * diff, axis=0) / (self.sigma ** 2)
 
         return grad
 
@@ -206,9 +243,9 @@ class SpectralNystroem:
 
             w = K * Phin[:, i] / lam
 
-            phi_x.at[i].set(jnp.sum(w))
+            phi_x = phi_x.at[i].set(jnp.sum(w))
 
-            M.at[i].set(jnp.sum(w[:, None] * Xn, axis=0))
+            M = M.at[i].set(jnp.sum(w[:, None] * Xn, axis=0))
 
         # --------------------------------------------------
         # 3. embedding residual
@@ -227,3 +264,50 @@ class SpectralNystroem:
             v = v + r[i] * (M[i] - phi_x[i] * x)
 
         return jnp.dot(v, v) / d2
+
+    def distance_grad_and_norm(self, x, y):
+        eps = 1e-12
+
+        # nearest neighbors of x
+        d2_all = jnp.sum((self.X - x) ** 2, axis=1)
+        _, idx = jax.lax.top_k(-d2_all, self.k)
+
+        Xn = self.X[idx]  # (k, d)
+        Phin = self.Phi[idx]  # raw eigenvectors, (k, m)
+
+        diff = Xn - x[None, :]  # (k, d)
+        dist2 = jnp.sum(diff ** 2, axis=1)
+
+        K = jnp.exp(-dist2 / (2.0 * self.sigma ** 2))  # (k,)
+
+        inv_lam = 1.0 / (self.lam + eps)  # (m,)
+
+        # scaled Nyström embedding of x
+        psi_x = jnp.sum(K[:, None] * Phin, axis=0) * inv_lam
+
+        # scaled Nyström embedding of y
+        psi_y = self.embed_point(y)
+
+        # residual in scaled spectral space
+        r = psi_x - psi_y
+
+        d2_spec = jnp.dot(r, r) + eps
+        d_spec = jnp.sqrt(d2_spec)
+
+        # inner neighbor coefficient:
+        # A[a] = sum_l r_l * Phi_{a,l} / lambda_l
+        A = Phin @ (r * inv_lam)  # (k,)
+
+        # numerator of grad_d
+        q = jnp.sum((K * A)[:, None] * diff, axis=0)  # (d,)
+
+        # gradient of unsquared distance
+        grad_d = q / (self.sigma ** 2 * d_spec)
+
+        # squared Euclidean norm
+        grad_d_norm_sq = jnp.dot(grad_d, grad_d) + eps
+
+        return d_spec, grad_d, grad_d_norm_sq
+
+    def distance_grad_and_norm_batch(self, x, y):
+        return jax.vmap(self.distance_grad_and_norm)(x, y)
