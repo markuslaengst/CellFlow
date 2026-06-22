@@ -101,8 +101,10 @@ class SpectralNystroem:
     # Nyström extension
     # ---------------------------
     def embed_point(self, x):
-        _, idx = self.nn.kneighbors(x.reshape(1, -1))
-        idx = idx[0]
+        # Compute k-NN ids
+        d2 = jnp.sum((self.X - x) ** 2, axis=1)
+
+        idx = jnp.argsort(d2)[:self.k]
 
         Xn = self.X[idx]
         Phin = self.Phi[idx]
@@ -114,7 +116,7 @@ class SpectralNystroem:
 
         for i in range(m):
             lam_i = self.lam[i] + 1e-12
-            phi_x[i] = (1.0 / lam_i) * jnp.sum(K * Phin[:, i])
+            phi_x.at[i].set((1.0 / lam_i) * jnp.sum(K * Phin[:, i]))
 
         return phi_x
 
@@ -125,7 +127,7 @@ class SpectralNystroem:
     def spectral_distance(self, x, y):
         phi_x = self.embed_point(x)
         phi_y = self.embed_point(y)
-        return jnp.sum((self.embed_point(phi_x) - self.embed_point(phi_y))**2)
+        return jnp.sum((phi_x - phi_y)**2)
 
 
     # =====================================================
@@ -136,8 +138,10 @@ class SpectralNystroem:
         phi_x = self.embed_point(x)
         phi_y = self.embed_point(y)
 
-        _, idx = self.nn.kneighbors(x.reshape(1, -1))
-        idx = idx[0]
+        # Compute k-NN ids
+        d2 = jnp.sum((self.X - x) ** 2, axis=1)
+
+        idx = jnp.argsort(d2)[:self.k]
 
         Xn = self.X[idx]
         Phin = self.Phi[idx]
@@ -161,9 +165,9 @@ class SpectralNystroem:
                 axis=0
             )
 
-            grad += coeff * s
+            grad = grad + coeff * s
 
-        grad *= 1.0 / (self.sigma**2)
+        grad = grad * 1.0 / (self.sigma**2)
 
         return grad
 
@@ -175,8 +179,10 @@ class SpectralNystroem:
         # --------------------------------------------------
         # 1. nearest neighbors
         # --------------------------------------------------
-        _, idx = self.nn.kneighbors(x.reshape(1, -1))
-        idx = idx[0]
+        # Compute k-NN ids
+        d2 = jnp.sum((self.X - x) ** 2, axis=1)
+
+        idx = jnp.argsort(d2)[:self.k]
 
         Xn = self.X[idx]
         Phin = self.Phi[idx]
@@ -200,16 +206,16 @@ class SpectralNystroem:
 
             w = K * Phin[:, i] / lam
 
-            phi_x[i] = jnp.sum(w)
+            phi_x.at[i].set(jnp.sum(w))
 
-            M[i] = jnp.sum(w[:, None] * Xn, axis=0)
+            M.at[i].set(jnp.sum(w[:, None] * Xn, axis=0))
 
         # --------------------------------------------------
         # 3. embedding residual
         # --------------------------------------------------
-        phi_y, _, _, _ = None, None, None, None  # if precomputed, plug it in
+        phi_y = self.embed_point(y)
 
-        r = phi_x - y  # if y already in embedding space
+        r = phi_x - phi_y  # if y already in embedding space
         d2 = jnp.dot(r, r) + 1e-12
 
         # --------------------------------------------------
@@ -218,6 +224,6 @@ class SpectralNystroem:
         v = jnp.zeros(d)
 
         for i in range(m):
-            v += r[i] * (M[i] - phi_x[i] * x)
+            v = v + r[i] * (M[i] - phi_x[i] * x)
 
         return jnp.dot(v, v) / d2
