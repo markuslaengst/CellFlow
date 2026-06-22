@@ -7,7 +7,7 @@ from numpy.typing import ArrayLike
 from tqdm import tqdm
 
 from cellflow.data._dataloader import OOCTrainSampler, TrainSampler, ValidationSampler
-from cellflow.solvers import _genot, _otfm
+from cellflow.solvers import _genot, _otfm, _otrfm
 from cellflow.training._callbacks import BaseCallback, CallbackRunner
 
 
@@ -35,11 +35,11 @@ class CellFlowTrainer:
 
     def __init__(
         self,
-        solver: _otfm.OTFlowMatching | _genot.GENOT,
+        solver: _otfm.OTFlowMatching | _genot.GENOT | _otrfm.OTRFlowMatching,
         predict_kwargs: dict[str, Any] | None = None,
         seed: int = 0,
     ):
-        if not isinstance(solver, (_otfm.OTFlowMatching | _genot.GENOT)):
+        if not isinstance(solver, (_otfm.OTFlowMatching | _genot.GENOT | _otrfm.OTRFlowMatching)):
             raise NotImplementedError(f"Solver must be an instance of OTFlowMatching or GENOT, got {type(solver)}")
 
         self.solver = solver

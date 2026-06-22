@@ -13,6 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pandas as pd
+from scipy.spatial import distance_matrix
 
 from cellflow import _constants
 from cellflow._compat import BrownianBridge, ConstantNoiseFlow
@@ -23,7 +24,8 @@ from cellflow.data._datamanager import DataManager
 from cellflow.model._utils import _write_predictions
 from cellflow.networks import _velocity_field
 from cellflow.plotting import _utils
-from cellflow.solvers import _genot, _otfm
+from cellflow.preprocessing._premetric import SpectralNystroem
+from cellflow.solvers import _genot, _otfm, _otrfm
 from cellflow.training._callbacks import BaseCallback
 from cellflow.training._trainer import CellFlowTrainer
 from cellflow.utils import match_linear
@@ -46,12 +48,17 @@ class CellFlow:
             Solver to use for training. Either ``'otfm'`` or ``'genot'``.
     """
 
-    def __init__(self, adata: ad.AnnData, solver: Literal["otfm", "genot"] = "otfm"):
+    def __init__(self, adata: ad.AnnData, solver: Literal["otfm", "genot", "otrfm"] = "otfm"):
         self._adata = adata
-        self._solver_class = _otfm.OTFlowMatching if solver == "otfm" else _genot.GENOT
+        if solver == "otfm":
+            self._solver_class = _otfm.OTFlowMatching
+        elif solver == "genot":
+            self._solver_class = _genot.GENOT
+        else:
+            self._solver_class = _otrfm.OTRFlowMatching
         self._vf_class = (
             _velocity_field.ConditionalVelocityField
-            if solver == "otfm"
+            if solver == "otfm" or solver == "otrfm"
             else _velocity_field.GENOTConditionalVelocityField
         )
         self._dataloader: TrainSampler | OOCTrainSampler | None = None
@@ -272,6 +279,7 @@ class CellFlow:
         solver_kwargs: dict[str, Any] | None = None,
         layer_norm_before_concatenation: bool = False,
         linear_projection_before_concatenation: bool = False,
+        nystroem: SpectralNystroem = SpectralNystroem,
         seed=0,
     ) -> None:
         """Prepare the model for training.
@@ -503,6 +511,17 @@ class CellFlow:
                 optimizer=optimizer,
                 conditions=self.train_data.condition_data,
                 rng=jax.random.PRNGKey(seed),
+                **solver_kwargs,
+            )
+        elif self._solver_class == _otrfm.OTRFlowMatching:
+            self._solver = self._solver_class(
+                vf=self.vf,
+                match_fn=match_fn,
+                probability_path=probability_path,
+                optimizer=optimizer,
+                conditions=self.train_data.condition_data,
+                rng=jax.random.PRNGKey(seed),
+                nystroem = nystroem,
                 **solver_kwargs,
             )
         else:
