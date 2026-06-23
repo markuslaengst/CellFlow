@@ -92,7 +92,8 @@ class OTRFlowMatching:
             ) -> jnp.ndarray:
                 rng_flow, rng_encoder, rng_dropout = jax.random.split(rng, 3)
                 ode_solver = RFMInterpolation(self.nystroem)
-                x_t = ode_solver.interpolate(source, target, t, 300)
+                x_t = ode_solver.interpolate(source, target, t, 1)
+                jax.debug.print("source = {source}, xt = {x_t}, target = {target}, t = {t}", source = source, x_t = x_t, target = target, t = t)
                 v_t, mean_cond, logvar_cond = vf_state.apply_fn(
                     {"params": params},
                     t,

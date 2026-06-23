@@ -136,7 +136,7 @@ def spectral_distance(i, j, Psi):
 # NYSTRÖM EXTENSION (consistent version)
 # =========================================================
 class SpectralNystroem:
-    def __init__(self, X_train, Phi_train, eigenvalues, sigma, k=10):
+    def __init__(self, X_train, Phi_train, eigenvalues, sigma, psi, x_to_id, k=30):
         """
         Phi_train must be UNWEIGHTED eigenvectors (NOT Psi)
         """
@@ -145,6 +145,8 @@ class SpectralNystroem:
         self.lam = jnp.array(eigenvalues)
         self.sigma = sigma
         self.k = k
+        self.Psi = jnp.array(psi)
+        self.x_to_id = x_to_id
 
         self.nn = NearestNeighbors(n_neighbors=k)
         self.nn.fit(X_train)
@@ -172,99 +174,6 @@ class SpectralNystroem:
         return jnp.sum(K[:, None] * Phin, axis=0) / (self.lam + 1e-12)
 
 
-    # ---------------------------
-    # Spectral distance
-    # ---------------------------
-    def spectral_distance(self, x, y):
-        phi_x = self.embed_point(x)
-        phi_y = self.embed_point(y)
-        return jnp.sum((phi_x - phi_y)**2)
-
-
-    # =====================================================
-    # GRADIENT w.r.t. x
-    # =====================================================
-    def spectral_distance_grad(self, x, y):
-        phi_x = self.embed_point(x)
-        phi_y = self.embed_point(y)
-
-        d2 = jnp.sum((self.X - x) ** 2, axis=1)
-        idx = jnp.argsort(d2)[:self.k]
-
-        Xn = self.X[idx]  # (k, d)
-        Phin = self.Phi[idx]  # (k, m)
-
-        diff = Xn - x[None, :]  # (k, d)
-        dist2 = jnp.sum(diff ** 2, axis=1)
-
-        K = jnp.exp(-dist2 / (2.0 * self.sigma ** 2))  # (k,)
-
-        coeff = 2.0 * (phi_x - phi_y) / (self.lam + 1e-12)  # (m,)
-
-        # A[a] = sum_i Phin[a, i] * coeff[i]
-        A = Phin @ coeff  # (k,)
-
-        grad = jnp.sum((K * A)[:, None] * diff, axis=0) / (self.sigma ** 2)
-
-        return grad
-
-    def g_norm_fast(self, x, y):
-        """
-        Fast approximation of ||∇d||_g^2 using kernel moments.
-        """
-
-        # --------------------------------------------------
-        # 1. nearest neighbors
-        # --------------------------------------------------
-        # Compute k-NN ids
-        d2 = jnp.sum((self.X - x) ** 2, axis=1)
-
-        idx = jnp.argsort(d2)[:self.k]
-
-        Xn = self.X[idx]
-        Phin = self.Phi[idx]
-
-        diff = Xn - x[None, :]
-        dist2 = jnp.sum(diff ** 2, axis=1)
-
-        K = jnp.exp(-dist2 / (2 * self.sigma ** 2))
-
-        m = self.Phi.shape[1]
-        d = x.shape[0]
-
-        phi_x = jnp.zeros(m)
-        M = jnp.zeros((m, d))  # spectral × spatial moment
-
-        # --------------------------------------------------
-        # 2. compute moments
-        # --------------------------------------------------
-        for i in range(m):
-            lam = self.lam[i] + 1e-12
-
-            w = K * Phin[:, i] / lam
-
-            phi_x = phi_x.at[i].set(jnp.sum(w))
-
-            M = M.at[i].set(jnp.sum(w[:, None] * Xn, axis=0))
-
-        # --------------------------------------------------
-        # 3. embedding residual
-        # --------------------------------------------------
-        phi_y = self.embed_point(y)
-
-        r = phi_x - phi_y  # if y already in embedding space
-        d2 = jnp.dot(r, r) + 1e-12
-
-        # --------------------------------------------------
-        # 4. tangent projection in moment form
-        # --------------------------------------------------
-        v = jnp.zeros(d)
-
-        for i in range(m):
-            v = v + r[i] * (M[i] - phi_x[i] * x)
-
-        return jnp.dot(v, v) / d2
-
     def distance_grad_and_norm(self, x, y):
         eps = 1e-12
 
@@ -285,8 +194,10 @@ class SpectralNystroem:
         # scaled Nyström embedding of x
         psi_x = jnp.sum(K[:, None] * Phin, axis=0) * inv_lam
 
-        # scaled Nyström embedding of y
-        psi_y = self.embed_point(y)
+        # get scaled embedding of y
+        matches = jnp.all(self.x_to_id == y, axis=1)
+        idx = jnp.argmax(matches)
+        psi_y = self.Psi[idx]
 
         # residual in scaled spectral space
         r = psi_x - psi_y
