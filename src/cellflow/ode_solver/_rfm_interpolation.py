@@ -12,16 +12,16 @@ class RFMInterpolation:
         xt = x0.copy()
         current_t = 0
         for _ in range(steps):
-            v = self.u_t(xt, x1)
-            xt = xt - dt * v / (1 - current_t + 1e-11)
+            v = self.u_t(xt, x1, current_t)
+            xt = xt + dt * v
             current_t = current_t + dt
 
         return xt
 
-    def u_t(self, xt, x1):
+    def u_t(self, xt, x1, t):
         d, grad_d, g = self.nystroem.distance_grad_and_norm_batch(xt, x1)
 
-        u_t = -(d[:, None] * grad_d) / g[:, None]
+        u_t = (d[:, None] * grad_d) / g[:, None] / (1 - t)
 
         return u_t
 

@@ -92,8 +92,8 @@ class OTRFlowMatching:
             ) -> jnp.ndarray:
                 rng_flow, rng_encoder, rng_dropout = jax.random.split(rng, 3)
                 ode_solver = RFMInterpolation(self.nystroem)
-                x_t = ode_solver.interpolate(source, target, jnp.array([1, 1]), 300)
-                jax.debug.print("source = {source}, xt = {x_t}, target = {target}, t = {t}", source = source, x_t = x_t, target = target, t = t)
+                x_t = ode_solver.interpolate(source, target, t, 300)
+                #jax.debug.print("source = {source}, xt = {x_t}, target = {target}, t = {t}", source = source, x_t = x_t, target = target, t = t)
                 v_t, mean_cond, logvar_cond = vf_state.apply_fn(
                     {"params": params},
                     t,
@@ -103,7 +103,7 @@ class OTRFlowMatching:
                     rngs={"dropout": rng_dropout, "condition_encoder": rng_encoder},
                 )
                 # FM loss
-                u_t = ode_solver.u_t(x_t, target)
+                u_t = ode_solver.u_t(x_t, target, t)
                 flow_matching_loss = jnp.mean((v_t - u_t) ** 2)
                 condition_mean_regularization = 0.5 * jnp.mean(mean_cond**2)
                 condition_var_regularization = -0.5 * jnp.mean(1 + logvar_cond - jnp.exp(logvar_cond))

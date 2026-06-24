@@ -208,7 +208,7 @@ class SpectralNystroem:
 
         # inner neighbor coefficient:
         # A[a] = sum_l r_l * Phi_{a,l} / lambda_l
-        A = Psin @ (r * inv_lam)  # (k,)
+        A = Phin @ (r * inv_lam)  # (k,)
 
         # numerator of grad_d
         q = jnp.sum((K * A)[:, None] * diff, axis=0)  # (d,)
