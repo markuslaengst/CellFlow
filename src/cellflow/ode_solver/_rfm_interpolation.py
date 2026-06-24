@@ -10,10 +10,11 @@ class RFMInterpolation:
     def interpolate(self, x0, x1, t, steps):
         dt = t / steps
         xt = x0.copy()
-
+        current_t = 0
         for _ in range(steps):
             v = self.u_t(xt, x1)
-            xt = xt + dt * v
+            xt = xt - dt * v / (1 - current_t + 1e-11)
+            current_t = current_t + dt
 
         return xt
 

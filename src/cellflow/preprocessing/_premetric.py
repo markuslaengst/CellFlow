@@ -182,7 +182,8 @@ class SpectralNystroem:
         _, idx = jax.lax.top_k(-d2_all, self.k)
 
         Xn = self.X[idx]  # (k, d)
-        Phin = self.Phi[idx]  # raw eigenvectors, (k, m)
+        Phin = self.Phi[idx]
+        Psin = self.Psi[idx]  # raw eigenvectors, (k, m)
 
         diff = Xn - x[None, :]  # (k, d)
         dist2 = jnp.sum(diff ** 2, axis=1)
@@ -207,7 +208,7 @@ class SpectralNystroem:
 
         # inner neighbor coefficient:
         # A[a] = sum_l r_l * Phi_{a,l} / lambda_l
-        A = Phin @ (r * inv_lam)  # (k,)
+        A = Psin @ (r * inv_lam)  # (k,)
 
         # numerator of grad_d
         q = jnp.sum((K * A)[:, None] * diff, axis=0)  # (d,)
