@@ -53,6 +53,7 @@ class OTRFlowMatching:
         match_fn: Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray] | None = None,
         time_sampler: Callable[[jax.Array, int], jnp.ndarray] = solver_utils.uniform_sampler,
         nystroem: SpectralNystroem = SpectralNystroem,
+        projection_fn: Callable[[jnp.ndarray], jnp.ndarray] | None = None,
         **kwargs: Any,
     ):
         self._is_trained: bool = False
@@ -64,6 +65,7 @@ class OTRFlowMatching:
         self.match_fn = jax.jit(match_fn)
         self.ema = kwargs.pop("ema", 1.0)
         self.nystroem = nystroem
+        self.projection_fn = projection_fn
 
         self.vf_state = self.vf.create_train_state(input_dim=self.vf.output_dims[-1], **kwargs)
         self.vf_state_inference = self.vf.create_train_state(input_dim=self.vf.output_dims[-1], **kwargs)
@@ -91,7 +93,7 @@ class OTRFlowMatching:
                 rng: jax.Array,
             ) -> jnp.ndarray:
                 rng_flow, rng_encoder, rng_dropout = jax.random.split(rng, 3)
-                ode_solver = RFMInterpolation(self.nystroem)
+                ode_solver = RFMInterpolation(self.nystroem, projection_fn=self.projection_fn)
                 x_t = ode_solver.interpolate(source, target, t, 300)
                 #jax.debug.print("source = {source}, xt = {x_t}, target = {target}, t = {t}", source = source, x_t = x_t, target = target, t = t)
                 v_t, mean_cond, logvar_cond = vf_state.apply_fn(
