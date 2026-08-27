@@ -52,17 +52,23 @@ class OTRFlowMatching:
         probability_path: BaseFlow,
         match_fn: Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray] | None = None,
         time_sampler: Callable[[jax.Array, int], jnp.ndarray] = solver_utils.uniform_sampler,
-        nystroem: SpectralNystroem = SpectralNystroem,
+        nystroem: SpectralNystroem | None = None,
         projection_fn: Callable[[jnp.ndarray], jnp.ndarray] | None = None,
-        project_to_manifold: bool = True,
+        project_to_manifold: bool = False,
         interpolation_steps: int = 300,
-        min_gradient_norm_sq: float = 1e-6,
+        min_gradient_norm_sq: float = 0.0,
         time_epsilon: float = 1e-6,
-        max_velocity_norm: float | None = 10.0,
+        max_velocity_norm: float | None = None,
         **kwargs: Any,
     ):
         if interpolation_steps <= 0:
             raise ValueError("interpolation_steps must be positive.")
+        if (
+            nystroem is None
+            or isinstance(nystroem, type)
+            or not hasattr(nystroem, "distance_grad_and_norm_batch")
+        ):
+            raise TypeError("nystroem must be a fitted SpectralNystroem-like instance.")
 
         self._is_trained: bool = False
         self.vf = vf

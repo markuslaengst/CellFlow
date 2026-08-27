@@ -7,7 +7,7 @@ import pytest
 
 import cellflow
 from cellflow._compat import ConstantNoiseFlow
-from cellflow.solvers import _genot, _otfm
+from cellflow.solvers import _genot, _otfm, _otrfm
 from cellflow.utils import match_linear
 
 src = {
@@ -176,4 +176,23 @@ class TestSolver:
                     solver1.vf_state_inference.params,
                     solver1.vf_state.params,
                 )
+            )
+
+    def test_otrfm_requires_fitted_nystroem(self):
+        vf = cellflow.networks.ConditionalVelocityField(
+            output_dim=5,
+            max_combination_length=2,
+            condition_embedding_dim=12,
+            hidden_dims=(6, 6),
+            decoder_dims=(5, 5),
+        )
+
+        with pytest.raises(TypeError, match="fitted SpectralNystroem-like instance"):
+            _otrfm.OTRFlowMatching(
+                vf=vf,
+                match_fn=match_linear,
+                probability_path=ConstantNoiseFlow(0.0),
+                optimizer=optax.adam(1e-3),
+                conditions={"drug": np.random.rand(2, 1, 3)},
+                rng=vf_rng,
             )

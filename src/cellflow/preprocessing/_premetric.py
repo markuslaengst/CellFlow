@@ -1,9 +1,9 @@
-import numpy as np
-import jax.numpy as jnp
 import jax
-from sklearn.neighbors import NearestNeighbors
+import jax.numpy as jnp
+import numpy as np
 from scipy.sparse import coo_matrix, diags
 from scipy.sparse.linalg import lobpcg
+from sklearn.neighbors import NearestNeighbors
 
 
 # ---------------------------
@@ -43,6 +43,12 @@ def build_knn_graph(X, k=30, sigma=None, symmetrize="max", remove_self=True):
     """
 
     n = X.shape[0]
+    if k <= 0:
+        raise ValueError("k must be positive.")
+    if remove_self and k >= n:
+        raise ValueError(f"k must be smaller than the number of points when remove_self=True, got k={k} and n={n}.")
+    if not remove_self and k > n:
+        raise ValueError(f"k cannot exceed the number of points, got k={k} and n={n}.")
 
     if remove_self:
         n_neighbors = k + 1
@@ -59,7 +65,10 @@ def build_knn_graph(X, k=30, sigma=None, symmetrize="max", remove_self=True):
         ind = ind[:, 1:]
 
     if sigma is None:
-        sigma = np.median(dist)
+        positive_distances = dist[dist > 0]
+        if positive_distances.size == 0:
+            raise ValueError("Cannot infer sigma because all neighbor distances are zero.")
+        sigma = np.median(positive_distances)
 
     if sigma <= 0:
         raise ValueError(f"sigma must be positive, got sigma={sigma}")
@@ -92,6 +101,8 @@ def build_knn_graph(X, k=30, sigma=None, symmetrize="max", remove_self=True):
 # ---------------------------
 def normalized_laplacian(W):
     d = np.array(W.sum(axis=1)).flatten()
+    if np.any(d <= 0):
+        raise ValueError("Cannot build a normalized Laplacian from a graph with zero-degree nodes.")
     D_inv_sqrt = diags(1.0 / np.sqrt(d + 1e-12))
     I = diags(np.ones(len(d)))
 
@@ -102,12 +113,18 @@ def normalized_laplacian(W):
 # ---------------------------
 # Eigen decomposition
 # ---------------------------
-def compute_eigens(L, k=50):
+def compute_eigens(L, k=50, random_state=0, maxiter=200):
     n = L.shape[0]
-    X0 = np.random.randn(n, k)
+    if k <= 0:
+        raise ValueError("k must be positive.")
+    if k > n:
+        raise ValueError(f"k cannot exceed the matrix size, got k={k} and n={n}.")
+    rng = np.random.default_rng(random_state)
+    X0 = rng.standard_normal((n, k))
 
-    eigvals, eigvecs = lobpcg(L, X0, largest=False, maxiter=200)
-    return eigvals, eigvecs
+    eigvals, eigvecs = lobpcg(L, X0, largest=False, maxiter=maxiter)
+    order = np.argsort(eigvals)
+    return eigvals[order], eigvecs[:, order]
 
 
 def spectral_embedding_scale(eigvals, weight_type="biharmonic", eps=1e-8):
@@ -133,9 +150,11 @@ def spectral_embedding(eigvals, eigvecs, weight_type="biharmonic", eps=1e-8):
 # ---------------------------
 # Spectral distance
 # ---------------------------
-def spectral_distance(i, j, Psi):
+def spectral_distance(i, j, Psi, squared=False):
+    Psi = np.asarray(Psi)
     diff = Psi[i] - Psi[j]
-    return np.dot(diff, diff)
+    d2 = np.dot(diff, diff)
+    return d2 if squared else np.sqrt(d2)
 
 
 # =========================================================
@@ -156,21 +175,83 @@ class SpectralNystroem:
         spectral_scale=None,
         spectral_weight_type="biharmonic",
         embedding_eps=1e-8,
+        drop_trivial_eigenvectors=True,
+        trivial_eigenvalue_eps=1e-6,
+        min_extension_eigenvalue_abs=1e-6,
+        target_embedding="nystroem",
         eps=1e-12,
     ):
         """
         Phi_train must be UNWEIGHTED normalized-Laplacian eigenvectors (NOT Psi).
         """
+        X_train = np.asarray(X_train)
+        Phi_train = np.asarray(Phi_train)
+        eigenvalues = np.asarray(eigenvalues)
+        psi = np.asarray(psi)
+        x_to_id = np.asarray(x_to_id)
+
+        if X_train.ndim != 2:
+            raise ValueError("X_train must have shape (n_points, n_features).")
+        if Phi_train.ndim != 2:
+            raise ValueError("Phi_train must have shape (n_points, n_eigenvectors).")
+        if psi.ndim != 2:
+            raise ValueError("psi must have shape (n_points, n_eigenvectors).")
+        if eigenvalues.ndim != 1:
+            raise ValueError("eigenvalues must be one-dimensional.")
+        if Phi_train.shape != psi.shape:
+            raise ValueError(f"Phi_train and psi must have the same shape, got {Phi_train.shape} and {psi.shape}.")
+        if Phi_train.shape[0] != X_train.shape[0]:
+            raise ValueError(
+                f"Phi_train must have one row per training point, got {Phi_train.shape[0]} and {X_train.shape[0]}."
+            )
+        if Phi_train.shape[1] != eigenvalues.shape[0]:
+            raise ValueError(
+                "The number of eigenvectors must match the number of eigenvalues, "
+                f"got {Phi_train.shape[1]} and {eigenvalues.shape[0]}."
+            )
+        if x_to_id.shape != X_train.shape:
+            raise ValueError(f"x_to_id must have the same shape as X_train, got {x_to_id.shape} and {X_train.shape}.")
+        if trivial_eigenvalue_eps < 0:
+            raise ValueError("trivial_eigenvalue_eps must be non-negative.")
+        if min_extension_eigenvalue_abs < 0:
+            raise ValueError("min_extension_eigenvalue_abs must be non-negative.")
+        if target_embedding not in {"nystroem", "exact"}:
+            raise ValueError("target_embedding must be one of {'nystroem', 'exact'}.")
+
+        keep_components = np.ones_like(eigenvalues, dtype=bool)
+        if drop_trivial_eigenvectors:
+            keep_components &= eigenvalues > trivial_eigenvalue_eps
+        if min_extension_eigenvalue_abs > 0:
+            keep_components &= np.abs(1.0 - eigenvalues) > min_extension_eigenvalue_abs
+        if not np.any(keep_components):
+            raise ValueError(
+                "All spectral components were filtered. Use more eigenvectors or relax "
+                "`trivial_eigenvalue_eps` / `min_extension_eigenvalue_abs`."
+            )
+
+        self.spectral_component_mask = jnp.array(keep_components)
+        self.n_dropped_spectral_components = int(np.size(keep_components) - np.count_nonzero(keep_components))
+        Phi_train = Phi_train[:, keep_components]
+        eigenvalues = eigenvalues[keep_components]
+        psi = psi[:, keep_components]
+
         self.X = jnp.array(X_train)
         self.Phi = jnp.array(Phi_train)
         self.lam = jnp.array(eigenvalues)
         self.sigma = sigma
-        self.k = k
+        self.k = min(k, X_train.shape[0])
         self.Psi = jnp.array(psi)
         self.x_to_id = jnp.array(x_to_id)
         self.spectral_weight_type = spectral_weight_type
         self.embedding_eps = embedding_eps
+        self.drop_trivial_eigenvectors = drop_trivial_eigenvectors
+        self.trivial_eigenvalue_eps = trivial_eigenvalue_eps
+        self.min_extension_eigenvalue_abs = min_extension_eigenvalue_abs
+        self.target_embedding = target_embedding
         self.eps = eps
+
+        if self.k <= 0:
+            raise ValueError("k must be positive.")
 
         if graph is not None and train_degrees is not None:
             raise ValueError("Only one of graph or train_degrees can be provided.")
@@ -180,7 +261,7 @@ class SpectralNystroem:
         elif train_degrees is None:
             W, sigma = build_knn_graph(
                 np.asarray(X_train),
-                k=k,
+                k=min(k, X_train.shape[0] - 1),
                 sigma=sigma,
                 symmetrize="max",
                 remove_self=True,
@@ -203,16 +284,26 @@ class SpectralNystroem:
 
         if spectral_scale is None:
             spectral_scale = spectral_embedding_scale(
-                np.asarray(eigenvalues),
+                eigenvalues,
                 weight_type=spectral_weight_type,
                 eps=embedding_eps,
             )
+        else:
+            spectral_scale = np.asarray(spectral_scale)
+            if spectral_scale.shape == np.asarray(keep_components).shape:
+                spectral_scale = spectral_scale[keep_components]
+            elif spectral_scale.shape != eigenvalues.shape:
+                raise ValueError(
+                    "spectral_scale must have the same shape as the unfiltered or filtered eigenvalues, "
+                    f"got {spectral_scale.shape}; expected {np.asarray(keep_components).shape} "
+                    f"or {eigenvalues.shape}."
+                )
 
         spectral_scale = np.asarray(spectral_scale)
-        if spectral_scale.shape != np.asarray(eigenvalues).shape:
+        if spectral_scale.shape != eigenvalues.shape:
             raise ValueError(
                 "spectral_scale must have the same shape as eigenvalues, "
-                f"got {spectral_scale.shape} and {np.asarray(eigenvalues).shape}."
+                f"got {spectral_scale.shape} and {eigenvalues.shape}."
             )
         if np.any(~np.isfinite(spectral_scale)):
             raise ValueError("spectral_scale must contain only finite values.")
@@ -221,13 +312,13 @@ class SpectralNystroem:
 
         adjacency_eigenvalues = 1.0 - self.lam
         adjacency_eigenvalues = jnp.where(
-            jnp.abs(adjacency_eigenvalues) > eps,
+            jnp.abs(adjacency_eigenvalues) > min_extension_eigenvalue_abs,
             adjacency_eigenvalues,
-            jnp.where(adjacency_eigenvalues < 0.0, -eps, eps),
+            jnp.where(adjacency_eigenvalues < 0.0, -min_extension_eigenvalue_abs, min_extension_eigenvalue_abs),
         )
         self.embedding_scale = self.spectral_scale / adjacency_eigenvalues
 
-        self.nn = NearestNeighbors(n_neighbors=k)
+        self.nn = NearestNeighbors(n_neighbors=self.k)
         self.nn.fit(X_train)
 
     # ---------------------------
@@ -276,10 +367,14 @@ class SpectralNystroem:
     def distance_grad_and_norm(self, x, y):
         eps = self.eps
 
-        # Keep the differentiated x embedding continuous. Training/support points still
-        # use their exact stored embedding through embed_point(), where no x-gradient is needed.
+        # Keep the differentiated x embedding continuous. By default, the target
+        # embedding uses the same extension so the vector field does not chase an
+        # exact support embedding that the local Nystroem map may not reproduce.
         psi_x, diff, K, point_degree, degree_weighted_phi, spectral_sum = self._embed_point_with_terms(x)
-        psi_y = self.embed_point(y)
+        if self.target_embedding == "exact":
+            psi_y = self.embed_point(y)
+        else:
+            psi_y, *_ = self._embed_point_with_terms(y)
 
         # residual in scaled spectral space
         r = psi_x - psi_y

@@ -279,7 +279,7 @@ class CellFlow:
         solver_kwargs: dict[str, Any] | None = None,
         layer_norm_before_concatenation: bool = False,
         linear_projection_before_concatenation: bool = False,
-        nystroem: SpectralNystroem = SpectralNystroem,
+        nystroem: SpectralNystroem | None = None,
         seed=0,
     ) -> None:
         """Prepare the model for training.

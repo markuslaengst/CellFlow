@@ -42,10 +42,10 @@ class RFMInterpolation:
         self,
         nystroem: SpectralNystroem,
         projection_fn: Callable | None = None,
-        project_to_manifold: bool = True,
-        min_gradient_norm_sq: float = 1e-6,
+        project_to_manifold: bool = False,
+        min_gradient_norm_sq: float = 0.0,
         time_epsilon: float = 1e-6,
-        max_velocity_norm: float | None = 10.0,
+        max_velocity_norm: float | None = None,
     ):
         if min_gradient_norm_sq < 0:
             raise ValueError("min_gradient_norm_sq must be non-negative.")
@@ -71,9 +71,18 @@ class RFMInterpolation:
         return x
 
     def interpolate(self, x0, x1, t, steps):
-        dt = t / steps
-        xt = x0.copy()
-        current_t = 0
+        if steps <= 0:
+            raise ValueError("steps must be positive.")
+
+        xt = jnp.asarray(x0)
+        x1 = jnp.asarray(x1)
+        if xt.shape != x1.shape:
+            raise ValueError(f"x0 and x1 must have the same shape, got {xt.shape} and {x1.shape}.")
+
+        dt = jnp.asarray(t) / steps
+        if dt.ndim == 1:
+            dt = dt[:, None]
+        current_t = jnp.zeros_like(dt)
         for _ in range(steps):
             v = self.u_t(xt, x1, current_t)
             xt = xt + dt * v
@@ -86,6 +95,11 @@ class RFMInterpolation:
         d, grad_d, g = self.nystroem.distance_grad_and_norm_batch(xt, x1)
 
         gradient_norm_sq = jnp.maximum(g, self.min_gradient_norm_sq)
+        gradient_norm_sq = jnp.where(
+            gradient_norm_sq > 0.0,
+            gradient_norm_sq,
+            jnp.finfo(gradient_norm_sq.dtype).tiny,
+        )
         time_remaining = jnp.maximum(1.0 - jnp.asarray(t), self.time_epsilon)
         if time_remaining.ndim > 0:
             time_remaining = time_remaining.reshape((-1, 1))
