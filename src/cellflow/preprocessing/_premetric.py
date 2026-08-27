@@ -110,18 +110,24 @@ def compute_eigens(L, k=50):
     return eigvals, eigvecs
 
 
+def spectral_embedding_scale(eigvals, weight_type="biharmonic", eps=1e-8):
+    """Return the per-eigenvector scale used by the spectral embedding."""
+    if weight_type == "biharmonic":
+        return 1.0 / (eigvals + eps)
+    elif weight_type == "diffusion":
+        return np.exp(-0.5 * eigvals)
+    elif weight_type == "none":
+        return np.ones_like(eigvals)
+    raise ValueError("weight_type must be one of {'biharmonic', 'diffusion', 'none'}")
+
+
 # ---------------------------
 # Spectral scaling (your choice)
 # ---------------------------
 def spectral_embedding(eigvals, eigvecs, weight_type="biharmonic", eps=1e-8):
-    if weight_type == "biharmonic":
-        w = 1.0 / (eigvals + eps)**2
-    elif weight_type == "diffusion":
-        w = np.exp(-eigvals)
-    else:
-        w = np.ones_like(eigvals)
+    scale = spectral_embedding_scale(eigvals, weight_type=weight_type, eps=eps)
 
-    return eigvecs * np.sqrt(w)[None, :]
+    return eigvecs * scale[None, :]
 
 
 # ---------------------------
@@ -136,9 +142,24 @@ def spectral_distance(i, j, Psi):
 # NYSTRÖM EXTENSION (consistent version)
 # =========================================================
 class SpectralNystroem:
-    def __init__(self, X_train, Phi_train, eigenvalues, sigma, psi, x_to_id, k=30):
+    def __init__(
+        self,
+        X_train,
+        Phi_train,
+        eigenvalues,
+        sigma,
+        psi,
+        x_to_id,
+        k=30,
+        graph=None,
+        train_degrees=None,
+        spectral_scale=None,
+        spectral_weight_type="biharmonic",
+        embedding_eps=1e-8,
+        eps=1e-12,
+    ):
         """
-        Phi_train must be UNWEIGHTED eigenvectors (NOT Psi)
+        Phi_train must be UNWEIGHTED normalized-Laplacian eigenvectors (NOT Psi).
         """
         self.X = jnp.array(X_train)
         self.Phi = jnp.array(Phi_train)
@@ -146,7 +167,65 @@ class SpectralNystroem:
         self.sigma = sigma
         self.k = k
         self.Psi = jnp.array(psi)
-        self.x_to_id = x_to_id
+        self.x_to_id = jnp.array(x_to_id)
+        self.spectral_weight_type = spectral_weight_type
+        self.embedding_eps = embedding_eps
+        self.eps = eps
+
+        if graph is not None and train_degrees is not None:
+            raise ValueError("Only one of graph or train_degrees can be provided.")
+
+        if graph is not None:
+            train_degrees = np.asarray(graph.sum(axis=1)).ravel()
+        elif train_degrees is None:
+            W, sigma = build_knn_graph(
+                np.asarray(X_train),
+                k=k,
+                sigma=sigma,
+                symmetrize="max",
+                remove_self=True,
+            )
+            self.sigma = sigma
+            train_degrees = np.asarray(W.sum(axis=1)).ravel()
+
+        if self.sigma is None:
+            raise ValueError("sigma must be provided when graph or train_degrees is provided.")
+
+        train_degrees = np.asarray(train_degrees)
+        if train_degrees.shape != (np.asarray(X_train).shape[0],):
+            raise ValueError(
+                f"train_degrees must have shape ({np.asarray(X_train).shape[0]},), got {train_degrees.shape}."
+            )
+        if np.any(train_degrees <= 0):
+            raise ValueError("All train_degrees must be positive.")
+
+        self.train_degrees = jnp.array(train_degrees)
+
+        if spectral_scale is None:
+            spectral_scale = spectral_embedding_scale(
+                np.asarray(eigenvalues),
+                weight_type=spectral_weight_type,
+                eps=embedding_eps,
+            )
+
+        spectral_scale = np.asarray(spectral_scale)
+        if spectral_scale.shape != np.asarray(eigenvalues).shape:
+            raise ValueError(
+                "spectral_scale must have the same shape as eigenvalues, "
+                f"got {spectral_scale.shape} and {np.asarray(eigenvalues).shape}."
+            )
+        if np.any(~np.isfinite(spectral_scale)):
+            raise ValueError("spectral_scale must contain only finite values.")
+
+        self.spectral_scale = jnp.array(spectral_scale)
+
+        adjacency_eigenvalues = 1.0 - self.lam
+        adjacency_eigenvalues = jnp.where(
+            jnp.abs(adjacency_eigenvalues) > eps,
+            adjacency_eigenvalues,
+            jnp.where(adjacency_eigenvalues < 0.0, -eps, eps),
+        )
+        self.embedding_scale = self.spectral_scale / adjacency_eigenvalues
 
         self.nn = NearestNeighbors(n_neighbors=k)
         self.nn.fit(X_train)
@@ -162,43 +241,45 @@ class SpectralNystroem:
     # ---------------------------
     # Nyström extension
     # ---------------------------
-    def embed_point(self, x):
+    def _neighbor_indices(self, x):
         d2 = jnp.sum((self.X - x) ** 2, axis=1)
-        idx = jnp.argsort(d2)[:self.k]
+        _, idx = jax.lax.top_k(-d2, self.k)
+        return idx
 
+    def _training_embedding(self, x):
+        matches = jnp.all(self.x_to_id == x, axis=1)
+        idx = jnp.argmax(matches)
+        return matches[idx], self.Psi[idx]
+
+    def _embed_point_with_terms(self, x):
+        idx = self._neighbor_indices(x)
         Xn = self.X[idx]
         Phin = self.Phi[idx]
+        train_degrees = self.train_degrees[idx]
 
+        diff = Xn - x[None, :]
         K = self._kernel(x, Xn)
+        point_degree = jnp.maximum(jnp.sum(K), self.eps)
 
-        return jnp.sum(K[:, None] * Phin, axis=0) / (self.lam + 1e-12)
+        degree_weighted_phi = Phin / jnp.sqrt(jnp.maximum(train_degrees, self.eps))[:, None]
+        spectral_sum = jnp.sum(K[:, None] * degree_weighted_phi, axis=0)
+        point_degree_scale = 1.0 / jnp.sqrt(point_degree)
+        psi_x = spectral_sum * point_degree_scale * self.embedding_scale
 
+        return psi_x, diff, K, point_degree, degree_weighted_phi, spectral_sum
+
+    def embed_point(self, x):
+        psi_x, *_ = self._embed_point_with_terms(x)
+        is_training_point, psi_train = self._training_embedding(x)
+        return jnp.where(is_training_point, psi_train, psi_x)
 
     def distance_grad_and_norm(self, x, y):
-        eps = 1e-12
+        eps = self.eps
 
-        # nearest neighbors of x
-        d2_all = jnp.sum((self.X - x) ** 2, axis=1)
-        _, idx = jax.lax.top_k(-d2_all, self.k)
-
-        Xn = self.X[idx]  # (k, d)
-        Phin = self.Phi[idx]
-        Psin = self.Psi[idx]  # raw eigenvectors, (k, m)
-
-        diff = Xn - x[None, :]  # (k, d)
-        dist2 = jnp.sum(diff ** 2, axis=1)
-
-        K = jnp.exp(-dist2 / (2.0 * self.sigma ** 2))  # (k,)
-
-        inv_lam = 1.0 / (self.lam + eps)  # (m,)
-
-        # scaled Nyström embedding of x
-        psi_x = jnp.sum(K[:, None] * Phin, axis=0) * inv_lam
-
-        # get scaled embedding of y
-        matches = jnp.all(self.x_to_id == y, axis=1)
-        idx = jnp.argmax(matches)
-        psi_y = self.Psi[idx]
+        # Keep the differentiated x embedding continuous. Training/support points still
+        # use their exact stored embedding through embed_point(), where no x-gradient is needed.
+        psi_x, diff, K, point_degree, degree_weighted_phi, spectral_sum = self._embed_point_with_terms(x)
+        psi_y = self.embed_point(y)
 
         # residual in scaled spectral space
         r = psi_x - psi_y
@@ -206,18 +287,26 @@ class SpectralNystroem:
         d2_spec = jnp.dot(r, r) + eps
         d_spec = jnp.sqrt(d2_spec)
 
-        # inner neighbor coefficient:
-        # A[a] = sum_l r_l * Phi_{a,l} / lambda_l
-        A = Phin @ (r * inv_lam)  # (k,)
+        scaled_residual = r * self.embedding_scale
+        neighbor_coeff = degree_weighted_phi @ scaled_residual
+        normalization_coeff = jnp.dot(spectral_sum, scaled_residual)
+        kernel_diff = jnp.sum(K[:, None] * diff, axis=0)
 
-        # numerator of grad_d
-        q = jnp.sum((K * A)[:, None] * diff, axis=0)  # (d,)
+        q = (
+            jnp.sum((K * neighbor_coeff)[:, None] * diff, axis=0) / jnp.sqrt(point_degree)
+            - 0.5 * normalization_coeff * kernel_diff / (point_degree ** 1.5)
+        )
 
         # gradient of unsquared distance
         grad_d = q / (self.sigma ** 2 * d_spec)
 
         # squared Euclidean norm
         grad_d_norm_sq = jnp.dot(grad_d, grad_d) + eps
+
+        same_point = jnp.all(x == y)
+        d_spec = jnp.where(same_point, 0.0, d_spec)
+        grad_d = jnp.where(same_point, jnp.zeros_like(grad_d), grad_d)
+        grad_d_norm_sq = jnp.where(same_point, eps, grad_d_norm_sq)
 
         return d_spec, grad_d, grad_d_norm_sq
 

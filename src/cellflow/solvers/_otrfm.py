@@ -54,8 +54,16 @@ class OTRFlowMatching:
         time_sampler: Callable[[jax.Array, int], jnp.ndarray] = solver_utils.uniform_sampler,
         nystroem: SpectralNystroem = SpectralNystroem,
         projection_fn: Callable[[jnp.ndarray], jnp.ndarray] | None = None,
+        project_to_manifold: bool = True,
+        interpolation_steps: int = 300,
+        min_gradient_norm_sq: float = 1e-6,
+        time_epsilon: float = 1e-6,
+        max_velocity_norm: float | None = 10.0,
         **kwargs: Any,
     ):
+        if interpolation_steps <= 0:
+            raise ValueError("interpolation_steps must be positive.")
+
         self._is_trained: bool = False
         self.vf = vf
         self.condition_encoder_mode = self.vf.condition_mode
@@ -66,6 +74,11 @@ class OTRFlowMatching:
         self.ema = kwargs.pop("ema", 1.0)
         self.nystroem = nystroem
         self.projection_fn = projection_fn
+        self.project_to_manifold = project_to_manifold
+        self.interpolation_steps = interpolation_steps
+        self.min_gradient_norm_sq = min_gradient_norm_sq
+        self.time_epsilon = time_epsilon
+        self.max_velocity_norm = max_velocity_norm
 
         self.vf_state = self.vf.create_train_state(input_dim=self.vf.output_dims[-1], **kwargs)
         self.vf_state_inference = self.vf.create_train_state(input_dim=self.vf.output_dims[-1], **kwargs)
@@ -93,8 +106,15 @@ class OTRFlowMatching:
                 rng: jax.Array,
             ) -> jnp.ndarray:
                 rng_flow, rng_encoder, rng_dropout = jax.random.split(rng, 3)
-                ode_solver = RFMInterpolation(self.nystroem, projection_fn=self.projection_fn)
-                x_t = ode_solver.interpolate(source, target, t, 300)
+                ode_solver = RFMInterpolation(
+                    self.nystroem,
+                    projection_fn=self.projection_fn,
+                    project_to_manifold=self.project_to_manifold,
+                    min_gradient_norm_sq=self.min_gradient_norm_sq,
+                    time_epsilon=self.time_epsilon,
+                    max_velocity_norm=self.max_velocity_norm,
+                )
+                x_t = ode_solver.interpolate(source, target, t, self.interpolation_steps)
                 #jax.debug.print("source = {source}, xt = {x_t}, target = {target}, t = {t}", source = source, x_t = x_t, target = target, t = t)
                 v_t, mean_cond, logvar_cond = vf_state.apply_fn(
                     {"params": params},
