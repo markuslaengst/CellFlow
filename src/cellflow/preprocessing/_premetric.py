@@ -5,6 +5,8 @@ from scipy.sparse import coo_matrix, diags
 from scipy.sparse.linalg import lobpcg
 from sklearn.neighbors import NearestNeighbors
 
+from cellflow.preprocessing._kernels import SymmetricBandwidthKernel
+
 
 # ---------------------------
 # kNN graph construction
@@ -110,6 +112,12 @@ def normalized_laplacian(W):
     return L
 
 
+def unnormalized_laplacian(weights):
+    """Return the symmetric combinatorial Laplacian D - W."""
+    degrees = np.asarray(weights.sum(axis=1)).ravel()
+    return diags(degrees) - weights
+
+
 # ---------------------------
 # Eigen decomposition
 # ---------------------------
@@ -180,9 +188,20 @@ class SpectralNystroem:
         min_extension_eigenvalue_abs=1e-6,
         target_embedding="nystroem",
         eps=1e-12,
+        kernel: SymmetricBandwidthKernel | None = None,
+        laplacian_type="normalized",
     ):
         """
-        Phi_train must be UNWEIGHTED normalized-Laplacian eigenvectors (NOT Psi).
+        Extend unweighted Laplacian eigenvectors and differentiate the extension.
+
+        The default retains the fixed-bandwidth normalized-Laplacian extension.
+        A fitted ``kernel`` evaluates its complete support at each query,
+        independently of ``k``. For ``laplacian_type="normalized"``, fit its
+        graph with ``include_self=True`` so the continuous extension also
+        reproduces training eigenvectors. The unnormalized extension uses
+        component denominators ``degree(x) - eigenvalue`` and works with
+        either diagonal convention. Its near-zero denominators are clipped
+        using ``min_extension_eigenvalue_abs``.
         """
         X_train = np.asarray(X_train)
         Phi_train = np.asarray(Phi_train)
@@ -217,11 +236,15 @@ class SpectralNystroem:
             raise ValueError("min_extension_eigenvalue_abs must be non-negative.")
         if target_embedding not in {"nystroem", "exact"}:
             raise ValueError("target_embedding must be one of {'nystroem', 'exact'}.")
+        if laplacian_type not in {"normalized", "unnormalized"}:
+            raise ValueError("laplacian_type must be 'normalized' or 'unnormalized'.")
+        if kernel is not None and not np.array_equal(np.asarray(kernel.X), np.asarray(jnp.asarray(X_train))):
+            raise ValueError("kernel must be fitted on X_train in the same order.")
 
         keep_components = np.ones_like(eigenvalues, dtype=bool)
         if drop_trivial_eigenvectors:
             keep_components &= eigenvalues > trivial_eigenvalue_eps
-        if min_extension_eigenvalue_abs > 0:
+        if laplacian_type == "normalized" and min_extension_eigenvalue_abs > 0:
             keep_components &= np.abs(1.0 - eigenvalues) > min_extension_eigenvalue_abs
         if not np.any(keep_components):
             raise ValueError(
@@ -249,6 +272,8 @@ class SpectralNystroem:
         self.min_extension_eigenvalue_abs = min_extension_eigenvalue_abs
         self.target_embedding = target_embedding
         self.eps = eps
+        self.kernel = kernel
+        self.laplacian_type = laplacian_type
 
         if self.k <= 0:
             raise ValueError("k must be positive.")
@@ -257,19 +282,24 @@ class SpectralNystroem:
             raise ValueError("Only one of graph or train_degrees can be provided.")
 
         if graph is not None:
+            if kernel is not None and laplacian_type == "normalized" and np.any(graph.diagonal() != 1.0):
+                raise ValueError("Normalized kernel extensions require graph(include_self=True).")
             train_degrees = np.asarray(graph.sum(axis=1)).ravel()
         elif train_degrees is None:
-            W, sigma = build_knn_graph(
-                np.asarray(X_train),
-                k=min(k, X_train.shape[0] - 1),
-                sigma=sigma,
-                symmetrize="max",
-                remove_self=True,
-            )
-            self.sigma = sigma
+            if kernel is None:
+                W, sigma = build_knn_graph(
+                    np.asarray(X_train),
+                    k=min(k, X_train.shape[0] - 1),
+                    sigma=sigma,
+                    symmetrize="max",
+                    remove_self=True,
+                )
+                self.sigma = sigma
+            else:
+                W = kernel.graph(include_self=laplacian_type == "normalized")
             train_degrees = np.asarray(W.sum(axis=1)).ravel()
 
-        if self.sigma is None:
+        if self.sigma is None and kernel is None:
             raise ValueError("sigma must be provided when graph or train_degrees is provided.")
 
         train_degrees = np.asarray(train_degrees)
@@ -316,7 +346,11 @@ class SpectralNystroem:
             adjacency_eigenvalues,
             jnp.where(adjacency_eigenvalues < 0.0, -min_extension_eigenvalue_abs, min_extension_eigenvalue_abs),
         )
-        self.embedding_scale = self.spectral_scale / adjacency_eigenvalues
+        self.embedding_scale = (
+            self.spectral_scale / adjacency_eigenvalues
+            if laplacian_type == "normalized"
+            else self.spectral_scale
+        )
 
         self.nn = NearestNeighbors(n_neighbors=self.k)
         self.nn.fit(X_train)
@@ -325,6 +359,8 @@ class SpectralNystroem:
     # Gaussian kernel
     # ---------------------------
     def _kernel(self, x, Xn):
+        if self.kernel is not None:
+            return self.kernel(x)
         diff = Xn - x[None, :]
         dist2 = jnp.sum(diff**2, axis=1)
         return jnp.exp(-dist2 / (2 * self.sigma**2))
@@ -333,6 +369,8 @@ class SpectralNystroem:
     # Nyström extension
     # ---------------------------
     def _neighbor_indices(self, x):
+        if self.kernel is not None:
+            return jnp.arange(self.X.shape[0])
         d2 = jnp.sum((self.X - x) ** 2, axis=1)
         _, idx = jax.lax.top_k(-d2, self.k)
         return idx
@@ -348,18 +386,48 @@ class SpectralNystroem:
         Phin = self.Phi[idx]
         train_degrees = self.train_degrees[idx]
 
-        diff = Xn - x[None, :]
-        K = self._kernel(x, Xn)
-        point_degree = jnp.maximum(jnp.sum(K), self.eps)
+        if self.kernel is None:
+            weights = self._kernel(x, Xn)
+            kernel_gradients = weights[:, None] * (Xn - x[None, :]) / self.sigma**2
+        else:
+            weights, kernel_gradients = self.kernel.values_and_gradients(x)
+        raw_degree = jnp.sum(weights)
+        point_degree = jnp.maximum(raw_degree, self.eps)
 
-        degree_weighted_phi = Phin / jnp.sqrt(jnp.maximum(train_degrees, self.eps))[:, None]
-        spectral_sum = jnp.sum(K[:, None] * degree_weighted_phi, axis=0)
-        point_degree_scale = 1.0 / jnp.sqrt(point_degree)
-        psi_x = spectral_sum * point_degree_scale * self.embedding_scale
+        if self.laplacian_type == "normalized":
+            degree_weighted_phi = Phin / jnp.sqrt(jnp.maximum(train_degrees, self.eps))[:, None]
+            component_factors = self.embedding_scale / jnp.sqrt(point_degree)
+            factor_derivatives = -0.5 * component_factors / point_degree
+        else:
+            degree_weighted_phi = Phin
+            denominators = point_degree - self.lam
+            denominator_floor = max(self.min_extension_eigenvalue_abs, self.eps)
+            unclipped = jnp.abs(denominators) > denominator_floor
+            denominators = jnp.where(
+                unclipped, denominators, jnp.where(denominators < 0.0, -denominator_floor, denominator_floor)
+            )
+            component_factors = self.spectral_scale / denominators
+            factor_derivatives = jnp.where(unclipped, -self.spectral_scale / denominators**2, 0.0)
+        factor_derivatives = jnp.where(raw_degree > self.eps, factor_derivatives, 0.0)
+        spectral_sum = jnp.sum(weights[:, None] * degree_weighted_phi, axis=0)
+        psi_x = spectral_sum * component_factors
 
-        return psi_x, diff, K, point_degree, degree_weighted_phi, spectral_sum
+        return (
+            psi_x,
+            kernel_gradients,
+            degree_weighted_phi,
+            spectral_sum,
+            component_factors,
+            factor_derivatives,
+        )
+
+    def extend_point(self, x):
+        """Evaluate the continuous Nyström formula, including at training coordinates."""
+        return self._embed_point_with_terms(x)[0]
 
     def embed_point(self, x):
+        if self.kernel is not None:
+            return self.extend_point(x)
         psi_x, *_ = self._embed_point_with_terms(x)
         is_training_point, psi_train = self._training_embedding(x)
         return jnp.where(is_training_point, psi_train, psi_x)
@@ -370,7 +438,14 @@ class SpectralNystroem:
         # Keep the differentiated x embedding continuous. By default, the target
         # embedding uses the same extension so the vector field does not chase an
         # exact support embedding that the local Nystroem map may not reproduce.
-        psi_x, diff, K, point_degree, degree_weighted_phi, spectral_sum = self._embed_point_with_terms(x)
+        (
+            psi_x,
+            kernel_gradients,
+            degree_weighted_phi,
+            spectral_sum,
+            component_factors,
+            factor_derivatives,
+        ) = self._embed_point_with_terms(x)
         if self.target_embedding == "exact":
             psi_y = self.embed_point(y)
         else:
@@ -382,18 +457,17 @@ class SpectralNystroem:
         d2_spec = jnp.dot(r, r) + eps
         d_spec = jnp.sqrt(d2_spec)
 
-        scaled_residual = r * self.embedding_scale
+        scaled_residual = r * component_factors
         neighbor_coeff = degree_weighted_phi @ scaled_residual
-        normalization_coeff = jnp.dot(spectral_sum, scaled_residual)
-        kernel_diff = jnp.sum(K[:, None] * diff, axis=0)
-
-        q = (
-            jnp.sum((K * neighbor_coeff)[:, None] * diff, axis=0) / jnp.sqrt(point_degree)
-            - 0.5 * normalization_coeff * kernel_diff / (point_degree ** 1.5)
+        normalization_coeff = jnp.dot(r * spectral_sum, factor_derivatives)
+        degree_gradient = jnp.sum(kernel_gradients, axis=0)
+        distance_numerator = (
+            jnp.sum(neighbor_coeff[:, None] * kernel_gradients, axis=0)
+            + normalization_coeff * degree_gradient
         )
 
         # gradient of unsquared distance
-        grad_d = q / (self.sigma ** 2 * d_spec)
+        grad_d = distance_numerator / d_spec
 
         # squared Euclidean norm
         grad_d_norm_sq = jnp.dot(grad_d, grad_d) + eps
