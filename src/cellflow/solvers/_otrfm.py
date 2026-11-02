@@ -1,6 +1,6 @@
 import warnings
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
 import diffrax
 import jax
@@ -42,6 +42,24 @@ class OTRFlowMatching:
         time_sampler
             Time sampler with a ``(rng, n_samples) -> time`` signature, see e.g.
             :func:`ott.solvers.utils.uniform_sampler`.
+        loss_mode
+            Which interpolated points enter the flow-matching loss.
+
+            - ``"final"``: integrate each pair from ``0`` to its sampled time ``t`` in
+              ``interpolation_steps`` Euler steps; regress the field only at the final state.
+            - ``"trajectory"``: integrate each pair once from ``0`` towards ``1`` and regress the
+              field at every one of the ``interpolation_steps`` Euler states. The sampled time
+              offsets each pair's time grid, ``t_k = (t + k) / interpolation_steps``, so the
+              supervised times cover ``[0, 1)`` uniformly, as in ``"final"``. Both modes estimate
+              the same expected loss, so their values are comparable. The trajectory mode uses
+              ``interpolation_steps`` times more supervised points per pair for about the same
+              number of interpolation-field evaluations.
+        trajectory_end_time
+            Only used with ``loss_mode="trajectory"``. If :obj:`None`, the sampled time offsets
+            each pair's grid on ``[0, 1)`` as described above. If a float in ``(0, 1]``, the sampled
+            time is ignored: every pair is integrated on the fixed grid
+            ``t_k = k * trajectory_end_time / interpolation_steps``, ``k = 0, ..., interpolation_steps``,
+            and all ``interpolation_steps + 1`` states, including the start and the end, enter the loss.
         kwargs
             Keyword arguments for :meth:`cellflow.networks.ConditionalVelocityField.create_train_state`.
     """
@@ -59,10 +77,16 @@ class OTRFlowMatching:
         min_gradient_norm_sq: float = 0.0,
         time_epsilon: float = 1e-6,
         max_velocity_norm: float | None = None,
+        loss_mode: Literal["final", "trajectory"] = "final",
+        trajectory_end_time: float | None = None,
         **kwargs: Any,
     ):
         if interpolation_steps <= 0:
             raise ValueError("interpolation_steps must be positive.")
+        if loss_mode not in ("final", "trajectory"):
+            raise ValueError(f"loss_mode must be 'final' or 'trajectory', got {loss_mode!r}.")
+        if trajectory_end_time is not None and not 0.0 < trajectory_end_time <= 1.0:
+            raise ValueError(f"trajectory_end_time must be in (0, 1] or None, got {trajectory_end_time}.")
         if (
             nystroem is None
             or isinstance(nystroem, type)
@@ -85,6 +109,8 @@ class OTRFlowMatching:
         self.min_gradient_norm_sq = min_gradient_norm_sq
         self.time_epsilon = time_epsilon
         self.max_velocity_norm = max_velocity_norm
+        self.loss_mode = loss_mode
+        self.trajectory_end_time = trajectory_end_time
 
         self.vf_state = self.vf.create_train_state(input_dim=self.vf.output_dims[-1], **kwargs)
         self.vf_state_inference = self.vf.create_train_state(input_dim=self.vf.output_dims[-1], **kwargs)
@@ -120,19 +146,38 @@ class OTRFlowMatching:
                     time_epsilon=self.time_epsilon,
                     max_velocity_norm=self.max_velocity_norm,
                 )
-                x_t = ode_solver.interpolate(source, target, t, self.interpolation_steps)
-                #jax.debug.print("source = {source}, xt = {x_t}, target = {target}, t = {t}", source = source, x_t = x_t, target = target, t = t)
+                if self.loss_mode == "final":
+                    # Supervise only the last state of an interpolation from 0 to the sampled t.
+                    x_t = ode_solver.interpolate(source, target, t, self.interpolation_steps)
+                    u_t = ode_solver.u_t(x_t, target, t)
+                    t_query, noise_query = t, encoder_noise
+                elif self.trajectory_end_time is None:
+                    # Supervise every Euler state of one interpolation from 0 to 1. The sampled t
+                    # only offsets each sample's time grid, so the recorded times cover [0, 1).
+                    t_all, x_all, u_all = ode_solver.trajectory(source, target, self.interpolation_steps, offset=t)
+                else:
+                    # Supervise every state of an interpolation from 0 to a fixed end time on a fixed grid.
+                    t_all, x_all, u_all = ode_solver.trajectory(
+                        source, target, self.interpolation_steps,
+                        t_end=self.trajectory_end_time, include_end=True,
+                    )
+                if self.loss_mode == "trajectory":
+                    n_steps, n = x_all.shape[:2]
+                    t_query = t_all.reshape((n_steps * n, 1))
+                    x_t = x_all.reshape((n_steps * n, -1))
+                    u_t = u_all.reshape((n_steps * n, -1))
+                    # Rows are ordered (step, sample): row k * n + i belongs to sample i.
+                    noise_query = jnp.tile(encoder_noise, (n_steps, 1))
                 v_t, mean_cond, logvar_cond = vf_state.apply_fn(
                     {"params": params},
-                    t,
+                    t_query,
                     x_t,
                     conditions,
-                    encoder_noise=encoder_noise,
+                    encoder_noise=noise_query,
                     rngs={"dropout": rng_dropout, "condition_encoder": rng_encoder},
                 )
                 # FM loss
-                u_t = ode_solver.u_t(x_t, target, t)
-                flow_matching_loss = jnp.mean((v_t - u_t) ** 2)
+                flow_matching_loss = jnp.mean((v_t - jax.lax.stop_gradient(u_t)) ** 2)
                 condition_mean_regularization = 0.5 * jnp.mean(mean_cond**2)
                 condition_var_regularization = -0.5 * jnp.mean(1 + logvar_cond - jnp.exp(logvar_cond))
                 if self.condition_encoder_mode == "stochastic":

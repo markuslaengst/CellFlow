@@ -236,3 +236,29 @@ def test_normalized_kernel_extension_rejects_inconsistent_self_affinities(traini
 def test_invalid_kernel_parameters_are_rejected(training_points, options):
     with pytest.raises(ValueError):
         SymmetricBandwidthKernel(training_points, **options)
+
+
+@pytest.mark.parametrize("laplacian_type", ["unnormalized", "normalized"])
+def test_fit_kernel_nystroem_reproduces_training_coordinates(training_points, laplacian_type):
+    from cellflow.preprocessing import fit_kernel_nystroem
+
+    with jax.enable_x64():
+        fit = fit_kernel_nystroem(
+            training_points, "polynomial", density_k=8, delta=2.5, n_modes=4,
+            laplacian_type=laplacian_type, n_reconstruction_checks=6,
+        )
+
+    assert fit.model.Psi.shape == (len(training_points), 4)
+    assert fit.eigenvalues.shape == (4,) and np.all(np.diff(fit.eigenvalues) >= 0)
+    assert fit.diagnostics["components"] == 1
+    assert fit.diagnostics["extension_relative_error"] < 1e-6
+    assert fit.diagnostics["max_eigen_residual"] < 1e-6
+
+
+def test_fit_kernel_nystroem_rejects_disconnected_graph():
+    from cellflow.preprocessing import fit_kernel_nystroem
+
+    clusters = np.vstack([np.random.default_rng(0).normal(size=(20, 2)) + shift for shift in (0.0, 100.0)])
+    with pytest.raises(ValueError, match="components"):
+        fit_kernel_nystroem(clusters, "polynomial", density_k=4, delta=1.0, n_modes=3)
+

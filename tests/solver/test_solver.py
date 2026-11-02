@@ -196,3 +196,68 @@ class TestSolver:
                 conditions={"drug": np.random.rand(2, 1, 3)},
                 rng=vf_rng,
             )
+
+    @pytest.mark.parametrize(
+        ("loss_mode", "trajectory_end_time"), [("final", None), ("trajectory", None), ("trajectory", 0.99)]
+    )
+    @pytest.mark.parametrize("condition_mode", ["deterministic", "stochastic"])
+    def test_otrfm_loss_modes_train(self, loss_mode, trajectory_end_time, condition_mode):
+        import jax.numpy as jnp
+
+        class EuclideanPremetric:
+            def distance_grad_and_norm_batch(self, xt, x1):
+                diff = xt - x1
+                d = jnp.linalg.norm(diff, axis=1)
+                grad = diff / jnp.maximum(d[:, None], 1e-12)
+                return d, grad, jnp.sum(grad * grad, axis=1)
+
+        vf = cellflow.networks.ConditionalVelocityField(
+            output_dim=5,
+            max_combination_length=2,
+            condition_mode=condition_mode,
+            condition_embedding_dim=12,
+            hidden_dims=(16, 16),
+            decoder_dims=(16, 16),
+        )
+        solver = _otrfm.OTRFlowMatching(
+            vf=vf,
+            match_fn=match_linear,
+            probability_path=ConstantNoiseFlow(0.0),
+            optimizer=optax.adam(1e-3),
+            conditions={"drug": np.random.rand(2, 1, 3)},
+            rng=vf_rng,
+            nystroem=EuclideanPremetric(),
+            interpolation_steps=4,
+            loss_mode=loss_mode,
+            trajectory_end_time=trajectory_end_time,
+        )
+        batch = {
+            "src_cell_data": jnp.asarray(np.random.rand(8, 5)),
+            "tgt_cell_data": jnp.asarray(np.random.rand(8, 5)) + 3.0,
+            "condition": {"drug": jnp.asarray(np.random.rand(1, 1, 3))},
+        }
+        losses = [float(solver.step_fn(jax.random.PRNGKey(i), batch)) for i in range(3)]
+        assert np.all(np.isfinite(losses))
+        assert int(solver.vf_state.step) == 3
+
+    def test_otrfm_rejects_unknown_loss_mode(self):
+        vf = cellflow.networks.ConditionalVelocityField(
+            output_dim=5, max_combination_length=2, condition_embedding_dim=12,
+            hidden_dims=(6, 6), decoder_dims=(5, 5),
+        )
+
+        class Premetric:
+            def distance_grad_and_norm_batch(self, xt, x1):
+                raise NotImplementedError
+
+        with pytest.raises(ValueError, match="loss_mode"):
+            _otrfm.OTRFlowMatching(
+                vf=vf,
+                match_fn=match_linear,
+                probability_path=ConstantNoiseFlow(0.0),
+                optimizer=optax.adam(1e-3),
+                conditions={"drug": np.random.rand(2, 1, 3)},
+                rng=vf_rng,
+                nystroem=Premetric(),
+                loss_mode="all",
+            )
