@@ -1,10 +1,10 @@
-"""Helpers for the Riemannian flow-matching toy notebooks (annulus and torus).
+"""Helpers for the Riemannian flow-matching toy notebooks (annulus, swiss roll and torus).
 
 Modules
 -------
 geometry
     Base class shared by the toy domains.
-annulus, torus
+annulus, swiss_roll, torus
     Sampling, projection, velocity guards, domain diagnostics and drawing for each domain.
 kernels
     Kernel-profile comparison: fit, field diagnostics, guarded/unguarded trajectories, refinement.

@@ -1,6 +1,6 @@
-"""Figures shared by the annulus and torus notebooks.
+"""Figures shared by the annulus, swiss-roll and torus notebooks.
 
-Every function draws the domain through the geometry object (2D axes for the annulus,
+Every function draws the domain through the geometry object (2D axes for the annulus and swiss roll,
 3D axes for the torus) and calls ``plt.show()``.
 """
 

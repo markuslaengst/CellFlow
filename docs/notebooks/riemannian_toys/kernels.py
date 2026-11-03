@@ -244,7 +244,8 @@ def refinement_check(models, geometry, coarse_trajectories, starts, target, fina
         })
         print(
             f"{kernel_name}, {steps} guarded steps: mean endpoint error {np.mean(refined_errors):.4f}; "
-            f"maximum hole penetration {geometry_metrics['max_segment_hole_penetration']:.4f}",
+            f"{geometry.segment_check_columns[0].replace('_', ' ')} "
+            f"{geometry_metrics[geometry.segment_check_columns[0]]:.4f}",
             flush=True,
         )
     return refined_trajectories, pd.DataFrame(rows).set_index("kernel")

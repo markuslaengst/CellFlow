@@ -300,7 +300,7 @@ def path_domain_summary(geometry, starts, trajectories, solver_steps, tol=1e-4):
     radial = geometry.radial_coordinate(trajectories)
     inside = geometry.contains(trajectories, tol=tol)
     axes = "xyz"[: trajectories.shape[-1]]
-    radial_name = "radius" if geometry.name == "annulus" else "tube_radius"
+    radial_name = geometry.radial_column
     return pd.DataFrame(
         {
             **{f"start_{a}": starts[:, i] for i, a in enumerate(axes)},

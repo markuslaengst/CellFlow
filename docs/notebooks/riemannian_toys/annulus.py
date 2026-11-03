@@ -110,6 +110,77 @@ class Annulus(ToyManifold):
     def radial_coordinate(self, samples):
         return np.linalg.norm(samples, axis=-1)
 
+    def max_penetration(self, trajectories):
+        """Deepest saved path state inside the hole."""
+        return float(np.maximum(self.inner_radius - self.radial_coordinate(trajectories), 0).max())
+
+    def pair_masks(self, source, target):
+        """Same upper/lower half, and straight chord passing through the hole."""
+        pair_min_radius = straight_segment_min_radius(source[:, None, :], target[None, :, :])
+        return {
+            "same_half": np.sign(source[:, None, 1]) == np.sign(target[None, :, 1]),
+            "chord_through_hole": pair_min_radius < self.inner_radius,
+        }
+
+    def geodesic(self, x0, x1, times):
+        """Exact shortest paths in the annulus, traversed at constant speed.
+
+        The outer disk is convex, so only the hole is an obstacle. A pair whose straight chord
+        misses the hole is joined by that chord. Otherwise the shortest path consists of a tangent
+        segment to the inner circle, an arc along it, and a second tangent segment, wrapped around
+        the shorter side of the hole.
+
+        Parameters
+        ----------
+        x0, x1
+            Start and end points of shape ``(n, 2)`` inside the annulus.
+        times
+            Times in ``[0, 1]`` of shape ``(m,)``; ``t`` maps to arc length ``t * length``.
+
+        Returns
+        -------
+        ``(paths, lengths)`` with shapes ``(n, m, 2)`` and ``(n,)``.
+        """
+        x0, x1 = np.asarray(x0, dtype=np.float64), np.asarray(x1, dtype=np.float64)
+        times = np.asarray(times, dtype=np.float64)
+        r = self.inner_radius
+        rho0 = np.maximum(np.linalg.norm(x0, axis=-1), r)
+        rho1 = np.maximum(np.linalg.norm(x1, axis=-1), r)
+        phi0, phi1 = np.arctan2(x0[:, 1], x0[:, 0]), np.arctan2(x1[:, 1], x1[:, 0])
+        alpha0, alpha1 = np.arccos(np.clip(r / rho0, -1, 1)), np.arccos(np.clip(r / rho1, -1, 1))
+        tangent0, tangent1 = np.sqrt(rho0**2 - r**2), np.sqrt(rho1**2 - r**2)
+
+        # Counter-clockwise (+1) and clockwise (-1) wraps: leave the circle at phi0 + s*alpha0,
+        # follow it for `arc` radians in direction s, rejoin at phi1 - s*alpha1.
+        arcs = {s: np.mod(s * ((phi1 - s * alpha1) - (phi0 + s * alpha0)), 2 * np.pi) for s in (1, -1)}
+        sign = np.where(arcs[1] <= arcs[-1], 1.0, -1.0)
+        arc = np.minimum(arcs[1], arcs[-1])
+        wrap_length = tangent0 + r * arc + tangent1
+        straight = straight_segment_min_radius(x0, x1) >= r
+        lengths = np.where(straight, np.linalg.norm(x1 - x0, axis=-1), wrap_length)
+
+        s = times[None, :] * lengths[:, None]  # arc length along each path, (n, m)
+        chord = x0[:, None] + times[None, :, None] * (x1 - x0)[:, None]
+        leave = phi0 + sign * alpha0
+        leave_point = r * np.stack((np.cos(leave), np.sin(leave)), axis=-1)
+        join = leave + sign * arc
+        join_point = r * np.stack((np.cos(join), np.sin(join)), axis=-1)
+        first = x0[:, None] + (s / np.maximum(tangent0, 1e-12)[:, None])[..., None] * (leave_point - x0)[:, None]
+        angle = leave[:, None] + sign[:, None] * (s - tangent0[:, None]) / r
+        on_arc = r * np.stack((np.cos(angle), np.sin(angle)), axis=-1)
+        last_fraction = (s - tangent0[:, None] - r * arc[:, None]) / np.maximum(tangent1, 1e-12)[:, None]
+        last = join_point[:, None] + np.clip(last_fraction, 0, 1)[..., None] * (x1 - join_point)[:, None]
+        wrapped = np.where(
+            (s <= tangent0[:, None])[..., None], first,
+            np.where((s <= (tangent0 + r * arc)[:, None])[..., None], on_arc, last),
+        )
+        return np.where(straight[:, None, None], chord, wrapped), lengths
+
+    def winding_angle(self, paths):
+        """Total change of the polar angle along paths ``(..., m, 2)``: its sign tells the side of the hole."""
+        angles = np.unwrap(np.arctan2(paths[..., 1], paths[..., 0]), axis=-1)
+        return angles[..., -1] - angles[..., 0]
+
     def path_geometry(self, path):
         segments = np.diff(path, axis=0)
         closest_radii = straight_segment_min_radius(path[:-1], path[1:])

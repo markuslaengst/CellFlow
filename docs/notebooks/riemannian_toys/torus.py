@@ -25,6 +25,7 @@ class Torus(ToyManifold):
     )
     subplot_kw = {"projection": "3d"}
     radial_label = "Distance to the major circle"
+    radial_column = "tube_radius"
 
     def __init__(self, major_radius=2.0, minor_radius=0.75, n_probe_major=24, n_probe_minor=8):
         if not major_radius > minor_radius > 0.0:

@@ -35,6 +35,10 @@ class ToyManifold:
     segment_check_columns = ("max_domain_violation",)
     subplot_kw: dict = {}
     radial_label = "radius"
+    radial_column = "radius"
+    """Column suffix for :meth:`radial_coordinate` in per-path summaries."""
+    penetration_name = "max_hole_penetration"
+    """Name of :meth:`max_penetration` in the multi-seed loss-mode results."""
 
     # Geometry -------------------------------------------------------------------------------
     def project(self, x):
@@ -65,6 +69,14 @@ class ToyManifold:
 
     def radial_coordinate(self, samples):
         """Scalar coordinate plotted against time to show departures from the domain."""
+        raise NotImplementedError
+
+    def max_penetration(self, trajectories) -> float:
+        """Worst shortcut depth of saved path states, used by the multi-seed loss-mode comparison."""
+        raise NotImplementedError
+
+    def pair_masks(self, source, target) -> dict:
+        """Boolean ``(n_source, n_target)`` pair diagnostics for the coupling comparison table."""
         raise NotImplementedError
 
     def path_geometry(self, path) -> dict:

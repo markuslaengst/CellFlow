@@ -47,6 +47,14 @@ MULTISEED_METRICS = [
 ]
 
 
+def multiseed_metric_names(geometry):
+    """:data:`MULTISEED_METRICS` with the geometry's column names (identical for the annulus)."""
+    return [
+        "energy_distance_squared", f"outside_{geometry.name}_fraction", f"fresh_paths_leaving_{geometry.name}",
+        geometry.penetration_name, "field_mse", "field_mse_t<0.9",
+    ]
+
+
 # Single run --------------------------------------------------------------------------------------
 def interpolator_like(model, nystroem):
     """An :class:`RFMInterpolation` with ``model``'s training interpolation settings."""
@@ -111,7 +119,7 @@ def endpoint_and_path_metrics(model, adata, target_key, condition_name, target, 
         **endpoint_metrics(predicted, target, geometry),
         **{key: path_metrics[key] for key in (
             f"paths_leaving_{geometry.name}", f"fraction_saved_points_in_{geometry.name}",
-            "max_segment_hole_penetration")},
+            geometry.segment_check_columns[0])},
     }
     return predicted, paths, metrics
 
@@ -196,7 +204,6 @@ def multiseed_metrics(model, eval_states, source, target, geometry, fresh_starts
     _, condition, _ = inference_inputs(model)
     predicted = np.asarray(model.solver.predict(source, condition))
     paths, _ = integrate_learned_paths(model, fresh_starts, save_times, check_prediction=False)
-    radii = geometry.radial_coordinate(paths)
     inside = geometry.contains(paths)
     distribution = endpoint_metrics(predicted, target, geometry)
     return {
@@ -204,7 +211,7 @@ def multiseed_metrics(model, eval_states, source, target, geometry, fresh_starts
         f"outside_{geometry.name}_fraction": distribution[f"outside_{geometry.name}_fraction"],
         f"fresh_paths_leaving_{geometry.name}": float(np.mean(~inside.all(axis=1))),
         f"fresh_saved_points_in_{geometry.name}": float(inside.mean()),
-        "max_hole_penetration": float(np.maximum(geometry.inner_radius - radii, 0).max()),
+        geometry.penetration_name: geometry.max_penetration(paths),
         "field_mse": float(sq.mean() / 2),
         "field_mse_t<0.9": float(sq[ts[:, 0] < 0.9].mean() / 2),
         "field_mse_by_t_decile": [
@@ -303,14 +310,14 @@ def show_multiseed_tables(rows, configs, seeds, metrics=MULTISEED_METRICS):
     return frame
 
 
-def plot_multiseed(frame, configs, seeds, colors=MULTISEED_COLORS):
+def plot_multiseed(frame, configs, seeds, colors=MULTISEED_COLORS, geometry_name="annulus"):
     """Per-seed energy distance and endpoints outside; 100-step field error by time and training progress."""
     settings = list(dict.fromkeys(config[0] for config in configs))
     variants_100 = [variant for setting, variant, *_ in configs if setting == "100 steps"]
     fig, axes = plt.subplots(1, 4, figsize=(24, 4.8), constrained_layout=True)
     for ax, column, title in [
         (axes[0], "energy_distance_squared", "Squared energy distance to target"),
-        (axes[1], "outside_annulus_fraction", "Predicted endpoints outside annulus"),
+        (axes[1], f"outside_{geometry_name}_fraction", f"Predicted endpoints outside {geometry_name}"),
     ]:
         labelled = set()
         for position, setting in enumerate(settings):

@@ -8,16 +8,21 @@ from riemannian_toys.annulus import straight_segment_min_radius
 from riemannian_toys.flows import check_coupling, endpoint_metrics, integrate_learned_paths, loss_summary, train_timed
 
 
-def coupling_comparison_table(couplings, cost_matrices, source, target, hole_radius):
-    """Marginals, transported costs, and how much mass pairs the same half or crosses the hole.
+def coupling_comparison_table(couplings, cost_matrices, source, target, hole_radius=None, pair_masks=None):
+    """Marginals, transported costs, and the coupled mass of each pair mask.
 
-    ``same_half_mass`` is the coupled mass whose endpoints lie on the same side of the x-axis;
-    ``chord_through_hole_mass`` the mass whose straight chord passes within ``hole_radius`` of
-    the origin. An independent coupling is added as a reference.
+    Without ``pair_masks`` (annulus): ``same_half_mass`` is the coupled mass whose endpoints lie
+    on the same side of the x-axis; ``chord_through_hole_mass`` the mass whose straight chord
+    passes within ``hole_radius`` of the origin. ``pair_masks`` (e.g. ``geometry.pair_masks``)
+    replaces both with ``{name}_mass`` columns. An independent coupling is added as a reference.
     """
     n_source, n_target = len(source), len(target)
-    pair_min_radius = straight_segment_min_radius(source[:, None, :], target[None, :, :])
-    same_half = np.sign(source[:, None, 1]) == np.sign(target[None, :, 1])
+    if pair_masks is None:
+        pair_min_radius = straight_segment_min_radius(source[:, None, :], target[None, :, :])
+        pair_masks = {
+            "same_half": np.sign(source[:, None, 1]) == np.sign(target[None, :, 1]),
+            "chord_through_hole": pair_min_radius < hole_radius,
+        }
     independent = np.full((n_source, n_target), 1.0 / (n_source * n_target))
     rows = []
     for name, coupling in [*couplings.items(), ("independent", independent)]:
@@ -29,20 +34,22 @@ def coupling_comparison_table(couplings, cost_matrices, source, target, hole_rad
             "max_source_marginal_error": np.max(np.abs(coupling.sum(axis=1) - 1 / n_source)),
             "max_target_marginal_error": np.max(np.abs(coupling.sum(axis=0) - 1 / n_target)),
             **{f"mean_{cost_name.lower()}_cost": np.sum(mass * cost) for cost_name, cost in cost_matrices.items()},
-            "same_half_mass": np.sum(mass * same_half),
-            "chord_through_hole_mass": np.sum(mass * (pair_min_radius < hole_radius)),
+            **{f"{mask_name}_mass": np.sum(mass * mask) for mask_name, mask in pair_masks.items()},
         })
     return pd.DataFrame(rows).set_index("coupling")
 
 
-def plot_coupling_comparison(geometry, couplings, source, target, seed, n_pairs=40):
-    """Couplings sorted by height (top) and the most likely partner of sampled sources (bottom)."""
-    source_order, target_order = np.argsort(source[:, 1]), np.argsort(target[:, 1])
+def plot_coupling_comparison(geometry, couplings, source, target, seed, n_pairs=40, sort_by=None, sort_label="y"):
+    """Couplings sorted by ``sort_by(points)`` (default: height; top) and the most likely partner of sampled
+    sources (bottom)."""
+    sort_by = (lambda points: points[:, 1]) if sort_by is None else sort_by
+    source_order, target_order = np.argsort(sort_by(source)), np.argsort(sort_by(target))
     pair_sources = np.random.default_rng(seed).choice(len(source), n_pairs, replace=False)
     fig, axes = plt.subplots(2, len(couplings), figsize=(6 * len(couplings), 11), constrained_layout=True)
     for column, (name, coupling) in enumerate(couplings.items()):
         image = axes[0, column].imshow(coupling[np.ix_(source_order, target_order)], aspect="auto", origin="lower")
-        axes[0, column].set(xlabel="Target index (sorted by y)", ylabel="Source index (sorted by y)",
+        axes[0, column].set(xlabel=f"Target index (sorted by {sort_label})",
+                            ylabel=f"Source index (sorted by {sort_label})",
                             title=f"{name} entropic OT coupling")
         fig.colorbar(image, ax=axes[0, column])
         ax = axes[1, column]
