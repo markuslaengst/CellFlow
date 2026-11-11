@@ -26,6 +26,7 @@ class Torus(ToyManifold):
     subplot_kw = {"projection": "3d"}
     radial_label = "Distance to the major circle"
     radial_column = "tube_radius"
+    penetration_name = "max_surface_deviation"
 
     def __init__(self, major_radius=2.0, minor_radius=0.75, n_probe_major=24, n_probe_minor=8):
         if not major_radius > minor_radius > 0.0:
@@ -140,6 +141,15 @@ class Torus(ToyManifold):
     def radial_coordinate(self, samples):
         return self.tube_radius(samples)
 
+    def max_penetration(self, trajectories):
+        """Largest surface deviation over saved path states (a shortcut through the tube or the hole)."""
+        return float(self.violation(trajectories).max())
+
+    def loss_mode_domain_metrics(self):
+        """Unconstrained predictions are never exactly on the surface, so the binary inside/outside
+        counts are uninformative; report continuous surface deviations instead."""
+        return ["mean_surface_deviation", "fresh_paths_mean_max_violation", self.penetration_name]
+
     def path_geometry(self, path):
         segment_starts = path[:-1]
         segments = np.diff(path, axis=0)
@@ -183,11 +193,13 @@ class Torus(ToyManifold):
     def path_metrics(self, trajectories):
         """Surface deviation of saved path states, for paths ``(n, T, 3)``."""
         deviation = self.violation(trajectories)
+        inside = self.contains(trajectories)
         return {
             "mean_max_surface_deviation": deviation.max(axis=1).mean(),
             "max_surface_deviation": deviation.max(),
             "mean_endpoint_surface_deviation": deviation[:, -1].mean(),
-            "fraction_saved_points_on_torus": np.mean(deviation <= 1e-4),
+            "paths_leaving_torus": int(np.count_nonzero(~inside.all(axis=1))),
+            "fraction_saved_points_in_torus": np.mean(inside),
         }
 
     # Drawing --------------------------------------------------------------------------------

@@ -48,11 +48,8 @@ MULTISEED_METRICS = [
 
 
 def multiseed_metric_names(geometry):
-    """:data:`MULTISEED_METRICS` with the geometry's column names (identical for the annulus)."""
-    return [
-        "energy_distance_squared", f"outside_{geometry.name}_fraction", f"fresh_paths_leaving_{geometry.name}",
-        geometry.penetration_name, "field_mse", "field_mse_t<0.9",
-    ]
+    """:data:`MULTISEED_METRICS` with the geometry's domain columns (identical for the annulus)."""
+    return ["energy_distance_squared", *geometry.loss_mode_domain_metrics(), "field_mse", "field_mse_t<0.9"]
 
 
 # Single run --------------------------------------------------------------------------------------
@@ -110,23 +107,22 @@ def field_error(model, eval_states, time_bins=None):
 def endpoint_and_path_metrics(model, adata, target_key, condition_name, target, geometry, fresh_starts, save_times):
     """Prediction of the fitted source, learned paths of the fresh starts, and their metrics.
 
+    The metrics are the endpoint metrics and all of :meth:`geometry.path_metrics` of the fresh paths.
     Returns ``(predicted, paths, metrics)``.
     """
     predicted = predict_target(model, adata, target_key, condition_name)
     paths, _ = integrate_learned_paths(model, fresh_starts, save_times)
-    path_metrics = geometry.path_metrics(paths)
-    metrics = {
-        **endpoint_metrics(predicted, target, geometry),
-        **{key: path_metrics[key] for key in (
-            f"paths_leaving_{geometry.name}", f"fraction_saved_points_in_{geometry.name}",
-            geometry.segment_check_columns[0])},
-    }
+    metrics = {**endpoint_metrics(predicted, target, geometry), **geometry.path_metrics(paths)}
     return predicted, paths, metrics
 
 
 def plot_single_run(losses, binned_errors, time_bins, couplings, predicted, trajectories, summary, geometry, source,
-                    target):
-    """Training losses and binned field error; then predictions and fresh-sample paths per model."""
+                    target, endpoint_note=None, path_note=None):
+    """Training losses and binned field error; then predictions and fresh-sample paths per model.
+
+    ``endpoint_note(metrics)`` and ``path_note(metrics, n_paths)`` format the domain part of the panel
+    titles from one row of ``summary``; the defaults report the off-domain fraction and leaving paths.
+    """
     fig, axes = plt.subplots(1, len(couplings) + 1, figsize=(20, 4.8), constrained_layout=True)
     for ax, coupling_name in zip(axes, couplings):
         for mode, color in LOSS_MODE_COLORS.items():
@@ -154,6 +150,12 @@ def plot_single_run(losses, binned_errors, time_bins, couplings, predicted, traj
                              subplot_kw=geometry.subplot_kw)
     outside = f"outside_{geometry.name}_fraction"
     leaving = f"paths_leaving_{geometry.name}"
+    if endpoint_note is None:
+        def endpoint_note(metrics):
+            return f"outside {metrics[outside]:.0%}"
+    if path_note is None:
+        def path_note(metrics, n_paths):
+            return f"{int(metrics[leaving])}/{n_paths} leave the {geometry.name}"
     for column, key in enumerate(summary.index):
         mode, coupling_name = key
         metrics = summary.loc[key]
@@ -161,7 +163,7 @@ def plot_single_run(losses, binned_errors, time_bins, couplings, predicted, traj
         geometry.scatter(ax, target, s=10, alpha=0.3, color="tab:orange", label="Target")
         geometry.scatter(ax, predicted[key], s=10, alpha=0.6, color=LOSS_MODE_COLORS[mode], label="Prediction")
         ax.set_title(f"{mode} loss, {coupling_name}\nenergy² {metrics['energy_distance_squared']:.3f}, "
-                     f"outside {metrics[outside]:.0%}")
+                     f"{endpoint_note(metrics)}")
         ax.legend(loc="upper right", fontsize=8)
         ax = axes[1, column]
         geometry.scatter(ax, source, s=6, alpha=0.12, color="tab:blue")
@@ -171,7 +173,7 @@ def plot_single_run(losses, binned_errors, time_bins, couplings, predicted, traj
             geometry.plot_path(ax, path, color=color, linewidth=2)
             geometry.scatter(ax, path[0][None], s=50, color=color, edgecolor="white", zorder=5)
             geometry.scatter(ax, path[-1][None], marker="X", s=70, color=color, edgecolor="white", zorder=6)
-        ax.set_title(f"Fresh-sample paths: {int(metrics[leaving])}/{len(trajectories[key])} leave the {geometry.name}")
+        ax.set_title(f"Fresh-sample paths: {path_note(metrics, len(trajectories[key]))}")
         for ax in axes[:, column]:
             geometry.finish_axes(ax, extra_points=extra)
     fig.suptitle("RFM final-point loss vs. trajectory loss; same data, architecture, seed and iterations")
@@ -198,24 +200,24 @@ def train_seeded(model, seed, n_iterations, batch_size):
 
 
 def multiseed_metrics(model, eval_states, source, target, geometry, fresh_starts, save_times):
-    """Endpoint, fresh-path and field-error metrics of one multi-seed run."""
-    ts, _, _ = eval_states
-    sq = np.sum((evaluate_learned_field(model, eval_states[1], ts) - eval_states[2]) ** 2, axis=1)
+    """Endpoint, fresh-path and field-error metrics of one multi-seed run; field MSEs are per coordinate."""
+    ts, xs, _ = eval_states
+    dim = xs.shape[1]
+    sq = np.sum((evaluate_learned_field(model, xs, ts) - eval_states[2]) ** 2, axis=1)
     _, condition, _ = inference_inputs(model)
     predicted = np.asarray(model.solver.predict(source, condition))
     paths, _ = integrate_learned_paths(model, fresh_starts, save_times, check_prediction=False)
     inside = geometry.contains(paths)
-    distribution = endpoint_metrics(predicted, target, geometry)
     return {
-        "energy_distance_squared": distribution["energy_distance_squared"],
-        f"outside_{geometry.name}_fraction": distribution[f"outside_{geometry.name}_fraction"],
+        **{key: float(value) for key, value in endpoint_metrics(predicted, target, geometry).items()},
         f"fresh_paths_leaving_{geometry.name}": float(np.mean(~inside.all(axis=1))),
         f"fresh_saved_points_in_{geometry.name}": float(inside.mean()),
+        "fresh_paths_mean_max_violation": float(geometry.violation(paths).max(axis=1).mean()),
         geometry.penetration_name: geometry.max_penetration(paths),
-        "field_mse": float(sq.mean() / 2),
-        "field_mse_t<0.9": float(sq[ts[:, 0] < 0.9].mean() / 2),
+        "field_mse": float(sq.mean() / dim),
+        "field_mse_t<0.9": float(sq[ts[:, 0] < 0.9].mean() / dim),
         "field_mse_by_t_decile": [
-            float(sq[(ts[:, 0] >= b / 10) & (ts[:, 0] < (b + 1) / 10)].mean() / 2) for b in range(10)
+            float(sq[(ts[:, 0] >= b / 10) & (ts[:, 0] < (b + 1) / 10)].mean() / dim) for b in range(10)
         ],
     }
 
@@ -310,14 +312,20 @@ def show_multiseed_tables(rows, configs, seeds, metrics=MULTISEED_METRICS):
     return frame
 
 
-def plot_multiseed(frame, configs, seeds, colors=MULTISEED_COLORS, geometry_name="annulus"):
-    """Per-seed energy distance and endpoints outside; 100-step field error by time and training progress."""
+def plot_multiseed(frame, configs, seeds, colors=MULTISEED_COLORS, geometry_name="annulus", domain_metric=None,
+                   domain_title=None):
+    """Per-seed energy distance and a domain metric; 100-step field error by time and training progress.
+
+    The domain panel defaults to the fraction of predicted endpoints outside the domain.
+    """
+    domain_metric = domain_metric or f"outside_{geometry_name}_fraction"
+    domain_title = domain_title or f"Predicted endpoints outside {geometry_name}"
     settings = list(dict.fromkeys(config[0] for config in configs))
     variants_100 = [variant for setting, variant, *_ in configs if setting == "100 steps"]
     fig, axes = plt.subplots(1, 4, figsize=(24, 4.8), constrained_layout=True)
     for ax, column, title in [
         (axes[0], "energy_distance_squared", "Squared energy distance to target"),
-        (axes[1], f"outside_{geometry_name}_fraction", f"Predicted endpoints outside {geometry_name}"),
+        (axes[1], domain_metric, domain_title),
     ]:
         labelled = set()
         for position, setting in enumerate(settings):

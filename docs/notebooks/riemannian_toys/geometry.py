@@ -75,6 +75,10 @@ class ToyManifold:
         """Worst shortcut depth of saved path states, used by the multi-seed loss-mode comparison."""
         raise NotImplementedError
 
+    def loss_mode_domain_metrics(self) -> list:
+        """Domain columns reported by the multi-seed loss-mode comparison (lower is better)."""
+        return [f"outside_{self.name}_fraction", f"fresh_paths_leaving_{self.name}", self.penetration_name]
+
     def pair_masks(self, source, target) -> dict:
         """Boolean ``(n_source, n_target)`` pair diagnostics for the coupling comparison table."""
         raise NotImplementedError
