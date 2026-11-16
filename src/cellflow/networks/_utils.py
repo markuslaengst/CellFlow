@@ -1,6 +1,7 @@
 import abc
 import math
 from collections.abc import Callable, Sequence
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -18,6 +19,8 @@ __all__ = [
     "ResNetBlock",
     "SelfAttentionBlock",
     "sinusoidal_time_encoder",
+    "LAYER_REGISTRY",
+    "register_layer",
 ]
 
 
@@ -58,12 +61,52 @@ def sinusoidal_time_encoder(t: jnp.ndarray, time_freqs: int = 1024, time_max_per
 class BaseModule(abc.ABC, nn.Module):
     """Base module for condition encoder and its components."""
 
+    #: Whether this block's ``__call__`` accepts an attention mask as its second
+    #: positional argument. Declared as a :class:`~typing.ClassVar` so it stays a
+    #: pure class-level capability flag and is *not* turned into a ``flax`` module
+    #: field (which would alter the constructor signature). :func:`_apply_modules`
+    #: dispatches on this flag instead of hard-coding ``isinstance`` checks.
+    takes_attention_mask: ClassVar[bool] = False
+
     @abc.abstractmethod
     def __call__(self, x: jnp.ndarray, training: bool = True) -> jnp.ndarray:
         """Forward pass."""
         pass
 
 
+#: Registry mapping a ``layer_type`` string to the block class that implements it.
+#: Populated via the :func:`register_layer` decorator and consulted by
+#: :func:`_get_layers` to instantiate blocks from config dicts. New block types can
+#: be added by decorating them with ``@register_layer(...)`` without touching the
+#: dispatch code.
+LAYER_REGISTRY: dict[str, type[BaseModule]] = {}
+
+
+def register_layer(name: str) -> Callable[[type[BaseModule]], type[BaseModule]]:
+    """Register a network block class under ``name`` in :data:`LAYER_REGISTRY`.
+
+    The decorated class can then be referenced by ``name`` through the
+    ``"layer_type"`` key of a layer config and is instantiated by
+    :func:`_get_layers`.
+
+    Parameters
+    ----------
+    name
+        Key under which the decorated class is registered.
+
+    Returns
+    -------
+    A class decorator that registers the class and returns it unchanged.
+    """
+
+    def decorator(cls: type[BaseModule]) -> type[BaseModule]:
+        LAYER_REGISTRY[name] = cls
+        return cls
+
+    return decorator
+
+
+@register_layer("mlp")
 class MLPBlock(BaseModule):
     """
     MLP block.
@@ -231,6 +274,7 @@ class SelfAttention(BaseModule):
 
     num_heads: int = 8
     qkv_dim: int = 64
+    ff_dim: int | None = None
     dropout_rate: float = 0.0
     transformer_block: bool = False
     layer_norm: bool = False
@@ -276,14 +320,20 @@ class SelfAttention(BaseModule):
             z = z + x
             if self.layer_norm:
                 z = nn.LayerNorm()(z)
-            # FC layer with residual connection
-            z_ = self.act_fn(nn.Dense(self.qkv_dim)(z))
-            z_ = nn.Dropout(self.dropout_rate)(z, deterministic=not training)
+            # position-wise feed-forward: expand to ff_dim (default 4x input_dim, the canonical
+            # transformer expansion — NOT qkv_dim), then project back to input_dim.
+            d_ff = self.ff_dim if self.ff_dim is not None else 4 * z.shape[-1]
+            z_ = self.act_fn(nn.Dense(d_ff)(z))
+            z_ = nn.Dense(z.shape[-1])(z_)
+            z_ = nn.Dropout(self.dropout_rate)(z_, deterministic=not training)
             z = z + z_
+            if self.layer_norm:
+                z = nn.LayerNorm()(z)
 
         return z.squeeze(1) if squeeze else z
 
 
+@register_layer("self_attention")
 class SelfAttentionBlock(BaseModule):
     """
     Several self-attention (+ optional FC layer) layers stacked together.
@@ -306,11 +356,16 @@ class SelfAttentionBlock(BaseModule):
     Output tensor of shape (batch_size, set_size, input_dim).
     """
 
+    #: This block consumes an attention mask (see :meth:`__call__`), so
+    #: :func:`_apply_modules` forwards ``attention_mask`` to it.
+    takes_attention_mask: ClassVar[bool] = True
+
     num_heads: Sequence[int] | int
     qkv_dim: Sequence[int] | int
     dropout_rate: float = 0.0
     transformer_block: bool = False
     layer_norm: bool = False
+    ff_dim: int | None = None
     act_fn: Callable[[jnp.ndarray], jnp.ndarray] = nn.silu
 
     def __post_init__(self) -> None:
@@ -351,6 +406,7 @@ class SelfAttentionBlock(BaseModule):
             z = SelfAttention(
                 num_heads=num_heads,
                 qkv_dim=qkv_dim,
+                ff_dim=self.ff_dim,
                 dropout_rate=self.dropout_rate,
                 transformer_block=self.transformer_block,
                 layer_norm=self.layer_norm,
@@ -427,7 +483,6 @@ class SeedAttentionPooling(BaseModule):
         K_ = jnp.concatenate(jnp.split(K, self.num_heads, axis=2), axis=0)
         V_ = jnp.concatenate(jnp.split(V, self.num_heads, axis=2), axis=0)
         A = jnp.matmul(Q_, K_.transpose(0, 2, 1)) / jnp.sqrt(self.v_dim)
-        A = jnp.matmul(Q_, K_.transpose(0, 2, 1)) / jnp.sqrt(self.v_dim)
         if mask is not None:
             # mask from (batch_, 1 | num_heads, set_, set_) to (batch_ * num_heads, 1, set_)
             mask = jnp.repeat(mask[:, 0, [0], :], self.num_heads, axis=0)
@@ -457,14 +512,26 @@ class TokenAttentionPooling(BaseModule):
     """
     Multi-head attention which aggregates sets by learning a token.
 
+    A learnable ``[CLS]`` token is prepended to the set and ``num_layers`` self-attention layers are
+    applied over ``{CLS, *tokens}`` (BERT/ViT-style); the CLS token's final state is returned as the
+    aggregate. ``num_layers=1`` with ``transformer_block=False`` reproduces the original single-attention
+    pooling. Set ``num_layers>=2`` (+ ``transformer_block=True``) to make the condition encoder a
+    transformer where every token attends to every other before the CLS read-out.
+
     Parameters
     ----------
     num_heads
-        Number of attention heads.
+        Number of attention heads (per layer).
     qkv_dim
-        Dimensionality of the query, key, and value.
+        Dimensionality of the query, key, and value (per layer).
     dropout_rate
         Dropout rate.
+    num_layers
+        Number of stacked self-attention layers over ``{CLS, *tokens}``.
+    transformer_block
+        Whether each layer is a full transformer block (adds a feed-forward sublayer with residual).
+    layer_norm
+        Whether to use layer normalization inside each transformer block.
     act_fn
         Activation function.
     """
@@ -472,6 +539,10 @@ class TokenAttentionPooling(BaseModule):
     num_heads: int = 8
     qkv_dim: int = 64
     dropout_rate: float = 0.0
+    num_layers: int = 1
+    transformer_block: bool = False
+    layer_norm: bool = False
+    ff_dim: int | None = None
     act_fn: Callable[[jnp.ndarray], jnp.ndarray] = nn.silu
 
     @nn.compact
@@ -506,18 +577,29 @@ class TokenAttentionPooling(BaseModule):
         token_mask = token_mask.at[:, :, 0, 1:].set(cls_token_to_data)
         token_mask = token_mask.at[:, :, 1:, 0].set(cls_token_to_data)
 
-        # attention
-        attention = nn.MultiHeadDotProductAttention(
-            num_heads=self.num_heads,
-            qkv_features=self.qkv_dim,
-            dropout_rate=self.dropout_rate,
-        )
-        emb = attention(z, mask=token_mask, deterministic=not training)
+        # transformer over {CLS, *tokens}: num_layers self-attention layers, then read out the CLS.
+        if self.num_layers == 1 and not self.transformer_block:
+            # backward-compatible single-attention path: identical module structure (hence Flax param
+            # tree) to the original TokenAttentionPooling, so historical (pre-refactor) checkpoints
+            # restore unchanged. num_layers>=2 or transformer_block=True use the SelfAttentionBlock.
+            z = nn.MultiHeadDotProductAttention(
+                num_heads=self.num_heads,
+                qkv_features=self.qkv_dim,
+                dropout_rate=self.dropout_rate,
+            )(z, mask=token_mask, deterministic=not training)
+        else:
+            z = SelfAttentionBlock(
+                num_heads=[self.num_heads] * self.num_layers,
+                qkv_dim=[self.qkv_dim] * self.num_layers,
+                ff_dim=self.ff_dim,
+                dropout_rate=self.dropout_rate,
+                transformer_block=self.transformer_block,
+                layer_norm=self.layer_norm,
+                act_fn=self.act_fn,
+            )(z, token_mask, training)
 
-        # only continue with token 0
-        z = emb[:, 0, :]
-
-        return z
+        # only continue with the CLS token (position 0)
+        return z[:, 0, :]
 
 
 def _get_layers(
@@ -531,13 +613,13 @@ def _get_layers(
         for layer in layers:
             layer = dict(layer)
             layer_type = layer.pop("layer_type", "mlp")
-            if layer_type == "mlp":
-                lay = MLPBlock(**layer)
-            elif layer_type == "self_attention":
-                lay = SelfAttentionBlock(**layer)
-            else:
-                raise ValueError(f"Unknown layer type: {layer_type}")
-            modules.append(lay)
+            try:
+                layer_cls = LAYER_REGISTRY[layer_type]
+            except KeyError:
+                raise ValueError(
+                    f"Unknown layer type: {layer_type!r}. Registered layer types: {sorted(LAYER_REGISTRY)}."
+                ) from None
+            modules.append(layer_cls(**layer))
     if output_dim is not None:
         modules.append(nn.Dense(output_dim))
         if dropout_rate is not None:
@@ -553,7 +635,7 @@ def _apply_modules(
 ) -> jnp.ndarray:
     """Apply modules to conditions."""
     for module in modules:
-        if isinstance(module, SelfAttentionBlock):
+        if getattr(module, "takes_attention_mask", False):
             conditions = module(conditions, attention_mask, training)
         elif isinstance(module, nn.Dense):
             conditions = module(conditions)

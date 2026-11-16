@@ -64,6 +64,11 @@ class OTRFlowMatching:
             Keyword arguments for :meth:`cellflow.networks.ConditionalVelocityField.create_train_state`.
     """
 
+    @staticmethod
+    def _match_kwargs(*, match_fn: Callable, data_dim: int) -> dict[str, Any]:
+        """Constructor kwargs derived from the model's match function, see :meth:`OTFlowMatching._match_kwargs`."""
+        return {"match_fn": match_fn}
+
     def __init__(
         self,
         vf: ConditionalVelocityField,

@@ -1,6 +1,6 @@
 import warnings
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import diffrax
 import jax
@@ -14,12 +14,93 @@ from cellflow import utils
 from cellflow._compat import BaseFlow
 from cellflow._types import ArrayLike
 from cellflow.networks._velocity_field import ConditionalVelocityField
+from cellflow.solvers._base import BaseSolver
 from cellflow.solvers.utils import ema_update
 
-__all__ = ["OTFlowMatching"]
+__all__ = ["OTFlowMatching", "ClassifierFreeGuidance", "Guidance"]
+
+# A velocity closure with the diffrax signature ``(t, x, args) -> velocity``,
+# where ``args`` is ``(params, condition, encoder_noise)``.
+VelocityFn = Callable[[jnp.ndarray, jnp.ndarray, tuple[Any, ...]], jnp.ndarray]
 
 
-class OTFlowMatching:
+@runtime_checkable
+class Guidance(Protocol):
+    """Pluggable transform applied to the base velocity field on the predict path.
+
+    A guidance strategy receives the base velocity closure ``vf(t, x, args,
+    force_uncond=False)`` — which owns the field's call signature and returns the
+    conditional (``force_uncond=False``) or unconditional (``True``) velocity — and
+    returns a plain ``(t, x, args) -> velocity`` closure. Taking the closure (rather
+    than the train state) keeps guidance agnostic to solver-specific ``args`` such as
+    GENOT's source ``x_0``.
+    """
+
+    def wrap(self, vf: Callable) -> VelocityFn:
+        """Wrap the base velocity ``vf`` and return the guided velocity."""
+        ...
+
+
+class ClassifierFreeGuidance:
+    """Classifier-free guidance on the predict path.
+
+    Combines the conditional velocity ``v_cond`` with the unconditional velocity
+    ``v_null`` (obtained by forcing the velocity field to drop its condition via
+    ``force_uncond=True``) according to ``v = v_null + scale * (v_cond - v_null)``.
+
+    A ``scale`` of ``1.0`` recovers the purely conditional velocity (and thus the
+    behavior without guidance), while larger values amplify the influence of the
+    condition. Using this strategy only makes sense for a velocity field trained
+    with ``condition_dropout_prob > 0`` so that ``v_null`` is meaningful.
+
+    How the unconditional ``v_null`` is defined (zeroed embedding vs a
+    :attr:`~cellflow.networks.ConditionalVelocityField.mask_value`-filled condition)
+    is controlled by the velocity field's ``condition_null`` mode; this strategy is
+    agnostic to it.
+
+    The equivalent "guidance weight" convention ``(1 + w) * v_cond - w * v_null``
+    (with ``w = 0`` meaning no guidance) is available via :meth:`from_ode_weight`,
+    since ``scale = 1 + w``.
+
+    Parameters
+    ----------
+    scale
+        Guidance strength.
+    """
+
+    def __init__(self, scale: float):
+        self.scale = scale
+
+    @classmethod
+    def from_ode_weight(cls, cfg_ode_weight: float) -> "ClassifierFreeGuidance":
+        """Build from the ``cfg_ode_weight`` convention: ``(1 + w) * v_cond - w * v_null``.
+
+        This is the parameterization used elsewhere in the ecosystem, where
+        ``cfg_ode_weight = 0`` means no guidance and larger values increase it. It
+        maps to ``scale = 1 + cfg_ode_weight``.
+        """
+        if cfg_ode_weight < 0:
+            raise ValueError("cfg_ode_weight must be non-negative.")
+        return cls(scale=1.0 + cfg_ode_weight)
+
+    def wrap(self, vf: Callable) -> VelocityFn:
+        """Return a velocity closure computing ``v_null + scale * (v_cond - v_null)``.
+
+        ``vf`` is the base velocity ``vf(t, x, args, force_uncond=False)``; it owns the
+        field's call signature, so this blend is agnostic to solver-specific ``args``
+        (e.g. GENOT threads its source ``x_0`` through ``args``).
+        """
+        scale = self.scale
+
+        def guided_vf(t: jnp.ndarray, x: jnp.ndarray, args: tuple[Any, ...]) -> jnp.ndarray:
+            v_cond = vf(t, x, args, force_uncond=False)
+            v_null = vf(t, x, args, force_uncond=True)
+            return v_null + scale * (v_cond - v_null)
+
+        return guided_vf
+
+
+class OTFlowMatching(BaseSolver):
     """(OT) flow matching :cite:`lipman:22` extended to the conditional setting.
 
     With an extension to OT-CFM :cite:`tong:23,pooladian:23`, and its
@@ -40,9 +121,24 @@ class OTFlowMatching:
         time_sampler
             Time sampler with a ``(rng, n_samples) -> time`` signature, see e.g.
             :func:`ott.solvers.utils.uniform_sampler`.
+        guidance
+            Optional guidance strategy applied to the velocity field on the predict
+            path, see e.g. :class:`ClassifierFreeGuidance`. If :obj:`None` (the
+            default), the plain conditional velocity field is used and prediction is
+            unchanged.
         kwargs
             Keyword arguments for :meth:`cellflow.networks.ConditionalVelocityField.create_train_state`.
     """
+
+    @staticmethod
+    def _match_kwargs(*, match_fn: Callable, data_dim: int) -> dict[str, Any]:
+        """Solver-specific constructor kwargs derived from the model's match function and data dim.
+
+        Called by :meth:`cellflow.model.CellFlow.prepare_model` so each solver owns how it names its
+        matching function and whether it needs source/target dimensions, keeping the model code free of
+        per-solver branches. ``OTFlowMatching`` matches on ``match_fn`` and takes no explicit dimensions.
+        """
+        return {"match_fn": match_fn}
 
     def __init__(
         self,
@@ -50,21 +146,17 @@ class OTFlowMatching:
         probability_path: BaseFlow,
         match_fn: Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray] | None = None,
         time_sampler: Callable[[jax.Array, int], jnp.ndarray] = solver_utils.uniform_sampler,
+        guidance: Guidance | None = None,
         **kwargs: Any,
     ):
-        self._is_trained: bool = False
-        self.vf = vf
-        self.condition_encoder_mode = self.vf.condition_mode
-        self.condition_encoder_regularization = self.vf.regularization
-        self.probability_path = probability_path
-        self.time_sampler = time_sampler
+        super().__init__(vf, probability_path, time_sampler)
         self.match_fn = jax.jit(match_fn)
+        self.guidance = guidance
         self.ema = kwargs.pop("ema", 1.0)
 
         self.vf_state = self.vf.create_train_state(input_dim=self.vf.output_dims[-1], **kwargs)
         self.vf_state_inference = self.vf.create_train_state(input_dim=self.vf.output_dims[-1], **kwargs)
         self.vf_step_fn = self._get_vf_step_fn()
-        self._predict_fn_cache: dict[frozen_dict.FrozenDict, Any] = {}
 
     def _get_vf_step_fn(self) -> Callable:  # type: ignore[type-arg]
         @jax.jit
@@ -165,43 +257,86 @@ class OTFlowMatching:
             )
         return loss
 
-    def get_condition_embedding(self, condition: dict[str, ArrayLike], return_as_numpy=True) -> ArrayLike:
-        """Get learnt embeddings of the conditions.
+    @property
+    def _inference_state(self) -> train_state.TrainState:
+        """OTFM predicts and reads condition embeddings from the EMA inference state."""
+        return self.vf_state_inference
 
-        Parameters
-        ----------
-        condition
-            Conditions to encode
-        return_as_numpy
-            Whether to return the embeddings as numpy arrays.
+    @property
+    def cfg_enabled(self) -> bool:
+        """Whether classifier-free guidance is available at predict time.
 
-        Returns
-        -------
-        Mean and log-variance of encoded conditions.
+        Guidance needs a meaningful unconditional velocity ``v_null``, which only
+        exists when the velocity field was trained with condition dropout
+        (``condition_dropout_prob > 0``). When ``False``, a per-call
+        ``guidance_scale`` is ignored (with a warning) and the plain conditional
+        velocity is used.
         """
-        cond_mean, cond_logvar = self.vf.apply(
-            {"params": self.vf_state_inference.params},
-            condition,
-            method="get_condition_embedding",
-        )
-        if return_as_numpy:
-            return np.asarray(cond_mean), np.asarray(cond_logvar)
-        return cond_mean, cond_logvar
+        return float(getattr(self.vf, "condition_dropout_prob", 0.0)) > 0.0
+
+    def _base_velocity(self) -> VelocityFn:
+        """Return the base (conditional) velocity closure used on the predict path.
+
+        The closure has the diffrax ``(t, x, args) -> velocity`` signature, with
+        ``args`` being ``(params, condition, encoder_noise)``, and evaluates the
+        inference velocity field conditionally (``force_uncond=False``).
+        """
+
+        def vf(
+            t: jnp.ndarray,
+            x: jnp.ndarray,
+            args: tuple[Any, dict[str, jnp.ndarray], jnp.ndarray],
+            force_uncond: bool = False,
+        ) -> jnp.ndarray:
+            params, condition, encoder_noise = args
+            return self.vf_state_inference.apply_fn(
+                {"params": params}, t, x, condition, encoder_noise, train=False, force_uncond=force_uncond
+            )[0]
+
+        return vf
 
     def _get_predict_fn(self, kwargs_frozen: frozen_dict.FrozenDict) -> Callable:
         """Build and cache a jit+vmap predict function for the given diffrax kwargs.
 
-        The returned function is created once per unique set of diffrax kwargs,
-        then reused on subsequent calls.
+        The base velocity closure is produced by :meth:`_base_velocity` and, when
+        guidance applies, wrapped by it. Guidance comes from one of two places:
+
+        - a per-call ``guidance_scale`` passed to :meth:`predict` (not a diffrax
+          arg; popped here). When it is not ``1.0`` it builds a
+          :class:`ClassifierFreeGuidance` for this call, overriding the
+          construction-time ``guidance`` — this is the convenient scalar entry point
+          (e.g. sweeping ``w`` at validation). It requires :attr:`cfg_enabled`;
+          otherwise it is ignored (with a warning) and the conditional velocity is used.
+        - the construction-time ``guidance`` strategy, used when ``guidance_scale``
+          is ``1.0`` (the default). With ``guidance=None`` the closure is exactly the
+          base conditional velocity, so prediction is unchanged.
+
+        ``guidance_scale`` is part of ``kwargs_frozen`` (the cache key), so distinct
+        scales get distinct compiled fns. The returned function is created once per
+        unique set of kwargs, then reused on subsequent calls.
         """
         if kwargs_frozen in self._predict_fn_cache:
             return self._predict_fn_cache[kwargs_frozen]
 
         kwargs = dict(kwargs_frozen)
+        guidance_scale = float(kwargs.pop("guidance_scale", 1.0))
+        guidance = self.guidance
+        if guidance_scale != 1.0:
+            if self.cfg_enabled:
+                # v = v_null + scale·(v_cond − v_null); overrides construction-time guidance.
+                guidance = ClassifierFreeGuidance(scale=guidance_scale)
+            else:
+                warnings.warn(
+                    f"guidance_scale={guidance_scale} ignored: the velocity field was not trained "
+                    "with classifier-free guidance (condition_dropout_prob == 0), so the "
+                    "unconditional velocity is undefined. Using the plain conditional velocity.",
+                    stacklevel=2,
+                )
+                guidance = None
 
-        def vf(t: jnp.ndarray, x: jnp.ndarray, args: tuple[Any, dict[str, jnp.ndarray], jnp.ndarray]) -> jnp.ndarray:
-            params, condition, encoder_noise = args
-            return self.vf_state_inference.apply_fn({"params": params}, t, x, condition, encoder_noise, train=False)[0]
+        vf = self._base_velocity()
+        if guidance is not None:
+            vf = guidance.wrap(vf)
 
         def solve_ode(
             params: Any, x: jnp.ndarray, condition: dict[str, jnp.ndarray], encoder_noise: jnp.ndarray
@@ -267,7 +402,11 @@ class OTFlowMatching:
             only used if ``condition_mode='stochastic'``. If :obj:`None`, the
             mean embedding is used.
         kwargs
-            Keyword arguments for :func:`diffrax.diffeqsolve`.
+            Keyword arguments for :func:`diffrax.diffeqsolve`. May also include
+            ``guidance_scale`` (a float): a per-call classifier-free guidance scale
+            that, when not ``1.0``, applies :class:`ClassifierFreeGuidance` for this
+            call (requires :attr:`cfg_enabled`), overriding the construction-time
+            ``guidance``. Handy for sweeping ``w`` without rebuilding the solver.
 
         Returns
         -------
@@ -291,12 +430,3 @@ class OTFlowMatching:
         else:
             x_pred = self._predict_jit(x, condition, rng, **kwargs)
             return np.array(x_pred)
-
-    @property
-    def is_trained(self) -> bool:
-        """Whether the model is trained."""
-        return self._is_trained
-
-    @is_trained.setter
-    def is_trained(self, value: bool) -> None:
-        self._is_trained = value

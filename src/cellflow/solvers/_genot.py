@@ -16,6 +16,8 @@ from cellflow import utils
 from cellflow._compat import BaseFlow
 from cellflow._types import ArrayLike
 from cellflow.model._utils import _multivariate_normal
+from cellflow.solvers._base import BaseSolver
+from cellflow.solvers._otfm import ClassifierFreeGuidance, Guidance, VelocityFn
 
 __all__ = ["GENOT"]
 
@@ -24,7 +26,7 @@ QuadTerm = tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray | None, jnp.ndarray | Non
 DataMatchFn = Callable[[LinTerm], jnp.ndarray] | Callable[[QuadTerm], jnp.ndarray]
 
 
-class GENOT:
+class GENOT(BaseSolver):
     """GENOT :cite:`klein:23` extended to the conditional setting.
 
     Parameters
@@ -57,6 +59,17 @@ class GENOT:
         Keyword arguments.
     """
 
+    @staticmethod
+    def _match_kwargs(*, match_fn: Callable, data_dim: int) -> dict[str, Any]:
+        """Solver-specific constructor kwargs derived from the model's match function and data dim.
+
+        Called by :meth:`cellflow.model.CellFlow.prepare_model` so each solver owns how it names its
+        matching function and whether it needs source/target dimensions, keeping the model code free of
+        per-solver branches. ``GENOT`` matches on ``data_match_fn`` and needs explicit
+        ``source_dim``/``target_dim``.
+        """
+        return {"data_match_fn": match_fn, "source_dim": data_dim, "target_dim": data_dim}
+
     def __init__(
         self,
         vf: nn.Module,
@@ -67,16 +80,13 @@ class GENOT:
         target_dim: int,
         time_sampler: Callable[[jax.Array, int], jnp.ndarray] = solver_utils.uniform_sampler,
         latent_noise_fn: (Callable[[jax.Array, tuple[int, ...]], jnp.ndarray] | None) = None,
+        guidance: Guidance | None = None,
         **kwargs: Any,
     ):
-        self._is_trained: bool = False
-        self.vf = vf
-        self.condition_encoder_mode = self.vf.condition_mode
-        self.condition_encoder_regularization = self.vf.regularization
-        self.probability_path = probability_path
+        super().__init__(vf, probability_path, time_sampler)
         self.data_match_fn = jax.jit(data_match_fn)
-        self.time_sampler = time_sampler
         self.source_dim = source_dim
+        self.guidance = guidance
         if latent_noise_fn is None:
             latent_noise_fn = functools.partial(_multivariate_normal, dim=target_dim)
         self.latent_noise_fn = latent_noise_fn
@@ -86,7 +96,6 @@ class GENOT:
             **kwargs,
         )
         self.vf_step_fn = self._get_vf_step_fn()
-        self._predict_fn_cache: dict[frozen_dict.FrozenDict, Any] = {}
 
     def _get_vf_step_fn(self) -> Callable:  #  type: ignore[type-arg]
         @jax.jit
@@ -121,7 +130,8 @@ class GENOT:
                     encoder_noise=encoder_noise,
                     rngs={"dropout": rng_dropout, "condition_encoder": rng_encoder},
                 )
-                u_t = self.probability_path.compute_ut(t, x_t, source, target)
+                # GENOT target is the latent->target path velocity (target - latent); source only conditions v.
+                u_t = self.probability_path.compute_ut(t, x_t, latent, target)
                 flow_matching_loss = jnp.mean((v_t - u_t) ** 2)
                 condition_mean_regularization = 0.5 * jnp.mean(mean_cond**2)
                 condition_var_regularization = -0.5 * jnp.mean(1 + logvar_cond - jnp.exp(logvar_cond))
@@ -207,30 +217,6 @@ class GENOT:
         )
         return loss
 
-    def get_condition_embedding(self, condition: dict[str, ArrayLike], return_as_numpy=True) -> ArrayLike:
-        """Get learnt embeddings of the conditions.
-
-        Parameters
-        ----------
-        condition
-            Conditions to encode
-        return_as_numpy
-            Whether to return the embeddings as numpy arrays.
-
-
-        Returns
-        -------
-        Mean and log-variance of encoded conditions.
-        """
-        cond_mean, cond_logvar = self.vf.apply(
-            {"params": self.vf_state.params},
-            condition,
-            method="get_condition_embedding",
-        )
-        if return_as_numpy:
-            return np.asarray(cond_mean), np.asarray(cond_logvar)
-        return cond_mean, cond_logvar
-
     def predict(
         self,
         x: ArrayLike,
@@ -282,22 +268,70 @@ class GENOT:
             x_pred = self._predict_jit(x, condition, rng, rng_genot, **kwargs)
             return np.array(x_pred)
 
+    @property
+    def cfg_enabled(self) -> bool:
+        """Whether classifier-free guidance is available at predict time.
+
+        Guidance needs a meaningful unconditional velocity ``v_null``, which only exists
+        when the velocity field was trained with condition dropout
+        (``condition_dropout_prob > 0``). When ``False``, a per-call ``guidance_scale`` is
+        ignored (with a warning) and the plain conditional velocity is used.
+        """
+        return float(getattr(self.vf, "condition_dropout_prob", 0.0)) > 0.0
+
+    def _base_velocity(self) -> VelocityFn:
+        """Base (conditional) velocity closure for the predict path.
+
+        Signature ``(t, x, args, force_uncond=False) -> velocity`` with ``args`` being
+        ``(params, x_0, condition, encoder_noise)``. Nulling only the condition (``x_0`` is
+        kept) gives the unconditional source→target velocity used by guidance.
+        """
+
+        def vf(
+            t: float,
+            x: jnp.ndarray,
+            args: tuple[Any, jnp.ndarray, dict[str, jnp.ndarray], jnp.ndarray],
+            force_uncond: bool = False,
+        ) -> jnp.ndarray:
+            params, x_0, condition, encoder_noise = args
+            return self.vf_state.apply_fn(
+                {"params": params}, t, x, x_0, condition, encoder_noise, train=False, force_uncond=force_uncond
+            )[0]
+
+        return vf
+
     def _get_predict_fn(self, kwargs_frozen: frozen_dict.FrozenDict) -> Callable:
         """Build and cache a jit+vmap predict function for the given diffrax kwargs.
 
-        The returned function is created once per unique set of diffrax kwargs,
-        then reused on subsequent calls.
+        The base velocity from :meth:`_base_velocity` is wrapped by guidance when it
+        applies: a per-call ``guidance_scale != 1.0`` (popped here, requires
+        :attr:`cfg_enabled`) builds a :class:`~cellflow.solvers.ClassifierFreeGuidance`
+        for this call, overriding the construction-time ``guidance``; otherwise the
+        construction-time ``guidance`` is used (``None`` = plain conditional velocity).
+        The returned function is created once per unique set of kwargs, then reused.
         """
         if kwargs_frozen in self._predict_fn_cache:
             return self._predict_fn_cache[kwargs_frozen]
 
         kwargs = dict(kwargs_frozen)
+        guidance_scale = float(kwargs.pop("guidance_scale", 1.0))
+        guidance = self.guidance
+        if guidance_scale != 1.0:
+            if self.cfg_enabled:
+                # v = v_null + scale·(v_cond − v_null); overrides construction-time guidance.
+                guidance = ClassifierFreeGuidance(scale=guidance_scale)
+            else:
+                warnings.warn(
+                    f"guidance_scale={guidance_scale} ignored: the velocity field was not trained "
+                    "with classifier-free guidance (condition_dropout_prob == 0), so the "
+                    "unconditional velocity is undefined. Using the plain conditional velocity.",
+                    stacklevel=2,
+                )
+                guidance = None
 
-        def vf(
-            t: float, x: jnp.ndarray, args: tuple[Any, jnp.ndarray, dict[str, jnp.ndarray], jnp.ndarray]
-        ) -> jnp.ndarray:
-            params, x_0, condition, encoder_noise = args
-            return self.vf_state.apply_fn({"params": params}, t, x, x_0, condition, encoder_noise, train=False)[0]
+        vf = self._base_velocity()
+        if guidance is not None:
+            vf = guidance.wrap(vf)
 
         def solve_ode(
             params: Any,
@@ -343,12 +377,3 @@ class GENOT:
 
         predict_fn = self._get_predict_fn(kwargs_frozen)
         return predict_fn(self.vf_state.params, latent, x, condition, encoder_noise)
-
-    @property
-    def is_trained(self) -> bool:
-        """If the model is trained."""
-        return self._is_trained
-
-    @is_trained.setter
-    def is_trained(self, value) -> None:
-        self._is_trained = value
