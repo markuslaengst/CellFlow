@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
@@ -35,8 +36,24 @@ def project_to_nearest_point(x, manifold_points):
     return projected.reshape(x.shape)
 
 
+VELOCITY_SCALES = ("current", "initial")
+
+
 class RFMInterpolation:
-    """Riemannian flow-matching interpolation using a spectral distance."""
+    """Riemannian flow-matching interpolation using a spectral distance.
+
+    The target velocity at ``x_t`` points along ``-grad d(x_t, x1) / ||grad d||^2``. Its magnitude is
+    set by ``velocity_scale``:
+
+    - ``"current"``: ``d(x_t, x1) / (1 - t)``, the formula of Riemannian flow matching
+      (Chen & Lipman, 2024) with the scheduler ``kappa(t) = 1 - t``. It depends on time and
+      contracts discretization error towards ``x1``.
+    - ``"initial"``: ``d(x0, x1)``, as in the reference implementation of Chen & Lipman
+      (``Mesh.solve_path``). It does not depend on time and has constant premetric speed, but it
+      does not correct discretization error. ``time_epsilon`` is unused.
+
+    Both agree on the exact path, where ``d(x_t, x1) = (1 - t) d(x0, x1)``.
+    """
 
     def __init__(
         self,
@@ -46,7 +63,10 @@ class RFMInterpolation:
         min_gradient_norm_sq: float = 0.0,
         time_epsilon: float = 1e-6,
         max_velocity_norm: float | None = None,
+        velocity_scale: Literal["current", "initial"] = "current",
     ):
+        if velocity_scale not in VELOCITY_SCALES:
+            raise ValueError(f"velocity_scale must be one of {VELOCITY_SCALES}, got {velocity_scale!r}.")
         if min_gradient_norm_sq < 0:
             raise ValueError("min_gradient_norm_sq must be non-negative.")
         if time_epsilon <= 0:
@@ -62,6 +82,13 @@ class RFMInterpolation:
         self.min_gradient_norm_sq = min_gradient_norm_sq
         self.time_epsilon = time_epsilon
         self.max_velocity_norm = max_velocity_norm
+        self.velocity_scale = velocity_scale
+
+    def initial_distance(self, x0, x1):
+        """``d(x0, x1)`` for ``velocity_scale="initial"``, else :obj:`None` (not needed)."""
+        if self.velocity_scale == "current":
+            return None
+        return self.nystroem.distance_grad_and_norm_batch(jnp.asarray(x0), jnp.asarray(x1))[0]
 
     def project(self, x):
         if self.projection_fn is not None:
@@ -79,12 +106,13 @@ class RFMInterpolation:
         if xt.shape != x1.shape:
             raise ValueError(f"x0 and x1 must have the same shape, got {xt.shape} and {x1.shape}.")
 
+        d0 = self.initial_distance(xt, x1)
         dt = jnp.asarray(t) / steps
         if dt.ndim == 1:
             dt = dt[:, None]
         current_t = jnp.zeros_like(dt)
         for _ in range(steps):
-            v = self.u_t(xt, x1, current_t)
+            v = self.u_t(xt, x1, current_t, d0=d0)
             xt = xt + dt * v
             xt = self.project(xt)
             current_t = current_t + dt
@@ -138,27 +166,33 @@ class RFMInterpolation:
         offset = jnp.zeros((n, 1), dtype=x0.dtype) if offset is None else jnp.asarray(offset, dtype=x0.dtype)
         offset = offset.reshape((n, 1))
         dt = t_end / steps
+        d0 = self.initial_distance(x0, x1)
 
         # First (partial) step from t=0 to t_0 = offset * dt.
         t_start = offset * dt
-        x = self.project(x0 + t_start * self.u_t(x0, x1, jnp.zeros_like(offset)))
+        x = self.project(x0 + t_start * self.u_t(x0, x1, jnp.zeros_like(offset), d0=d0))
 
         def body(x, k):
             t = (offset + k) * dt
-            u = self.u_t(x, x1, t)
+            u = self.u_t(x, x1, t, d0=d0)
             x_next = self.project(x + dt * u)
             return x_next, (t, x, u)
 
         x_last, (ts, xs, us) = jax.lax.scan(body, x, jnp.arange(steps, dtype=x0.dtype))
         if include_end:
             t_last = (offset + steps) * dt
-            u_last = self.u_t(x_last, x1, t_last)
+            u_last = self.u_t(x_last, x1, t_last, d0=d0)
             ts = jnp.concatenate((ts, t_last[None]), axis=0)
             xs = jnp.concatenate((xs, x_last[None]), axis=0)
             us = jnp.concatenate((us, u_last[None]), axis=0)
         return ts, xs, us
 
-    def u_t(self, xt, x1, t):
+    def u_t(self, xt, x1, t, d0=None):
+        """RFM target velocity at ``xt`` towards ``x1``.
+
+        ``d0`` is ``d(x0, x1)`` of shape ``(n,)``, see :meth:`initial_distance`. It is required for
+        ``velocity_scale="initial"`` and ignored otherwise.
+        """
         d, grad_d, g = self.nystroem.distance_grad_and_norm_batch(xt, x1)
 
         gradient_norm_sq = jnp.maximum(g, self.min_gradient_norm_sq)
@@ -167,11 +201,16 @@ class RFMInterpolation:
             gradient_norm_sq,
             jnp.finfo(gradient_norm_sq.dtype).tiny,
         )
-        time_remaining = jnp.maximum(1.0 - jnp.asarray(t), self.time_epsilon)
-        if time_remaining.ndim > 0:
-            time_remaining = time_remaining.reshape((-1, 1))
-
-        u_t = -(d[:, None] * grad_d) / gradient_norm_sq[:, None] / time_remaining
+        direction = -grad_d / gradient_norm_sq[:, None]
+        if self.velocity_scale == "initial":
+            if d0 is None:
+                raise ValueError("velocity_scale='initial' requires d0 = d(x0, x1), see `initial_distance`.")
+            u_t = jnp.reshape(d0, (-1, 1)) * direction
+        else:
+            time_remaining = jnp.maximum(1.0 - jnp.asarray(t), self.time_epsilon)
+            if time_remaining.ndim > 0:
+                time_remaining = time_remaining.reshape((-1, 1))
+            u_t = d[:, None] * direction / time_remaining
 
         if self.max_velocity_norm is not None:
             velocity_norm = jnp.linalg.norm(u_t, axis=1, keepdims=True)
@@ -207,6 +246,9 @@ class GuardedRFMInterpolation(RFMInterpolation):
         super().__init__(nystroem, projection_fn=projection_fn, **kwargs)
         self.velocity_guard_fn = velocity_guard_fn
 
-    def u_t(self, xt, x1, t):
+    def initial_distance(self, x0, x1):
+        return super().initial_distance(self.projection_fn(jnp.asarray(x0)), x1)
+
+    def u_t(self, xt, x1, t, d0=None):
         projected = self.projection_fn(xt)
-        return self.velocity_guard_fn(projected, super().u_t(projected, x1, t))
+        return self.velocity_guard_fn(projected, super().u_t(projected, x1, t, d0=d0))

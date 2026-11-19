@@ -555,7 +555,8 @@ class TestGuidance:
         ("loss_mode", "trajectory_end_time"), [("final", None), ("trajectory", None), ("trajectory", 0.99)]
     )
     @pytest.mark.parametrize("condition_mode", ["deterministic", "stochastic"])
-    def test_otrfm_loss_modes_train(self, loss_mode, trajectory_end_time, condition_mode):
+    @pytest.mark.parametrize("velocity_scale", ["current", "initial"])
+    def test_otrfm_loss_modes_train(self, loss_mode, trajectory_end_time, condition_mode, velocity_scale):
         import jax.numpy as jnp
 
         class EuclideanPremetric:
@@ -584,6 +585,7 @@ class TestGuidance:
             interpolation_steps=4,
             loss_mode=loss_mode,
             trajectory_end_time=trajectory_end_time,
+            velocity_scale=velocity_scale,
         )
         batch = {
             "src_cell_data": jnp.asarray(np.random.rand(8, 5)),
@@ -614,4 +616,26 @@ class TestGuidance:
                 rng=vf_rng,
                 nystroem=Premetric(),
                 loss_mode="all",
+            )
+
+    def test_otrfm_rejects_unknown_velocity_scale(self):
+        vf = cellflow.networks.ConditionalVelocityField(
+            output_dim=5, max_combination_length=2, condition_embedding_dim=12,
+            hidden_dims=(6, 6), decoder_dims=(5, 5),
+        )
+
+        class Premetric:
+            def distance_grad_and_norm_batch(self, xt, x1):
+                raise NotImplementedError
+
+        with pytest.raises(ValueError, match="velocity_scale"):
+            _otrfm.OTRFlowMatching(
+                vf=vf,
+                match_fn=match_linear,
+                probability_path=ConstantNoiseFlow(0.0),
+                optimizer=optax.adam(1e-3),
+                conditions={"drug": np.random.rand(2, 1, 3)},
+                rng=vf_rng,
+                nystroem=Premetric(),
+                velocity_scale="final",
             )

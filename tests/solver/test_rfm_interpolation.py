@@ -193,3 +193,69 @@ def test_guarded_interpolation_projects_query_and_filters_velocity():
 def test_guarded_interpolation_requires_projection_and_guard():
     with pytest.raises(ValueError, match="required"):
         GuardedRFMInterpolation(EuclideanPremetric(), projection_fn=None, velocity_guard_fn=lambda x, v: v)
+
+
+def test_initial_velocity_scale_has_constant_speed_d0():
+    interpolator = RFMInterpolation(ScaledEuclideanPremetric(2.0), velocity_scale="initial")
+    x0 = jnp.array([[0.0, 0.0], [1.0, 1.0]])
+    x1 = jnp.array([[3.0, 4.0], [1.0, -1.0]])
+    xt = jnp.array([[1.0, 1.0], [1.0, 0.5]])
+    d0 = interpolator.initial_distance(x0, x1)
+
+    u = np.asarray(interpolator.u_t(xt, x1, t=0.9, d0=d0))
+
+    # Direction -grad d / ||grad d||^2 = -(x - x1) / (scale ||x - x1||); speed d0 / scale = ||x0 - x1||.
+    direction = np.asarray(x1 - xt) / np.linalg.norm(np.asarray(x1 - xt), axis=1, keepdims=True)
+    np.testing.assert_allclose(u, direction * np.linalg.norm(np.asarray(x1 - x0), axis=1, keepdims=True), rtol=1e-6)
+    # Time-independent.
+    np.testing.assert_allclose(np.asarray(interpolator.u_t(xt, x1, t=0.1, d0=d0)), u, rtol=1e-6)
+
+
+def test_velocity_scales_agree_on_the_exact_path():
+    x0 = jnp.array([[0.0, 0.0], [2.0, -1.0]])
+    x1 = jnp.array([[3.0, 4.0], [-1.0, 3.0]])
+    t = jnp.array([[0.25], [0.7]])
+    xt = (1.0 - t) * x0 + t * x1
+    current = RFMInterpolation(ScaledEuclideanPremetric(3.0))
+    initial = RFMInterpolation(ScaledEuclideanPremetric(3.0), velocity_scale="initial")
+
+    np.testing.assert_allclose(
+        np.asarray(current.u_t(xt, x1, t)),
+        np.asarray(initial.u_t(xt, x1, t, d0=initial.initial_distance(x0, x1))),
+        rtol=1e-5,
+    )
+
+
+@pytest.mark.parametrize("velocity_scale", ["current", "initial"])
+def test_euclidean_trajectory_is_the_straight_line(velocity_scale):
+    interpolator = RFMInterpolation(EuclideanPremetric(), velocity_scale=velocity_scale)
+    x0 = jnp.array([[0.0, 0.0], [1.0, 2.0]])
+    x1 = jnp.array([[3.0, 4.0], [-2.0, 2.0]])
+
+    ts, xs, us = interpolator.trajectory(x0, x1, steps=8, include_end=True)
+
+    expected = (1.0 - ts) * x0[None] + ts * x1[None]
+    np.testing.assert_allclose(np.asarray(xs), np.asarray(expected), atol=1e-5)
+    np.testing.assert_allclose(np.asarray(us[:-1]), np.broadcast_to(np.asarray(x1 - x0), us[:-1].shape), atol=1e-5)
+    np.testing.assert_allclose(
+        np.asarray(interpolator.interpolate(x0, x1, t=1.0, steps=8)), np.asarray(x1), atol=1e-5
+    )
+
+
+def test_initial_velocity_scale_requires_initial_distance():
+    interpolator = RFMInterpolation(EuclideanPremetric(), velocity_scale="initial")
+    x = jnp.array([[0.0, 0.0]])
+
+    with pytest.raises(ValueError, match="requires d0"):
+        interpolator.u_t(x, x + 1.0, t=0.5)
+
+
+def test_current_velocity_scale_needs_no_initial_distance():
+    interpolator = RFMInterpolation(EuclideanPremetric())
+
+    assert interpolator.initial_distance(jnp.zeros((1, 2)), jnp.ones((1, 2))) is None
+
+
+def test_rejects_unknown_velocity_scale():
+    with pytest.raises(ValueError, match="velocity_scale"):
+        RFMInterpolation(EuclideanPremetric(), velocity_scale="constant")

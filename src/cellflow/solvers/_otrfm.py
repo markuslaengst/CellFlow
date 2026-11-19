@@ -60,6 +60,10 @@ class OTRFlowMatching:
             time is ignored: every pair is integrated on the fixed grid
             ``t_k = k * trajectory_end_time / interpolation_steps``, ``k = 0, ..., interpolation_steps``,
             and all ``interpolation_steps + 1`` states, including the start and the end, enter the loss.
+        velocity_scale
+            Magnitude of the RFM target velocity, see :class:`cellflow.ode_solver.RFMInterpolation`.
+            ``"current"`` uses ``d(x_t, x1) / (1 - t)``; ``"initial"`` uses ``d(x0, x1)`` as in the
+            reference implementation of Riemannian flow matching.
         kwargs
             Keyword arguments for :meth:`cellflow.networks.ConditionalVelocityField.create_train_state`.
     """
@@ -84,6 +88,7 @@ class OTRFlowMatching:
         max_velocity_norm: float | None = None,
         loss_mode: Literal["final", "trajectory"] = "final",
         trajectory_end_time: float | None = None,
+        velocity_scale: Literal["current", "initial"] = "current",
         **kwargs: Any,
     ):
         if interpolation_steps <= 0:
@@ -92,6 +97,8 @@ class OTRFlowMatching:
             raise ValueError(f"loss_mode must be 'final' or 'trajectory', got {loss_mode!r}.")
         if trajectory_end_time is not None and not 0.0 < trajectory_end_time <= 1.0:
             raise ValueError(f"trajectory_end_time must be in (0, 1] or None, got {trajectory_end_time}.")
+        if velocity_scale not in ("current", "initial"):
+            raise ValueError(f"velocity_scale must be 'current' or 'initial', got {velocity_scale!r}.")
         if (
             nystroem is None
             or isinstance(nystroem, type)
@@ -116,6 +123,7 @@ class OTRFlowMatching:
         self.max_velocity_norm = max_velocity_norm
         self.loss_mode = loss_mode
         self.trajectory_end_time = trajectory_end_time
+        self.velocity_scale = velocity_scale
 
         self.vf_state = self.vf.create_train_state(input_dim=self.vf.output_dims[-1], **kwargs)
         self.vf_state_inference = self.vf.create_train_state(input_dim=self.vf.output_dims[-1], **kwargs)
@@ -150,11 +158,12 @@ class OTRFlowMatching:
                     min_gradient_norm_sq=self.min_gradient_norm_sq,
                     time_epsilon=self.time_epsilon,
                     max_velocity_norm=self.max_velocity_norm,
+                    velocity_scale=self.velocity_scale,
                 )
                 if self.loss_mode == "final":
                     # Supervise only the last state of an interpolation from 0 to the sampled t.
                     x_t = ode_solver.interpolate(source, target, t, self.interpolation_steps)
-                    u_t = ode_solver.u_t(x_t, target, t)
+                    u_t = ode_solver.u_t(x_t, target, t, d0=ode_solver.initial_distance(source, target))
                     t_query, noise_query = t, encoder_noise
                 elif self.trajectory_end_time is None:
                     # Supervise every Euler state of one interpolation from 0 to 1. The sampled t

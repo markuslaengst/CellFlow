@@ -194,6 +194,7 @@ def rfm_solver_kwargs(model, **overrides):
         "min_gradient_norm_sq": solver.min_gradient_norm_sq,
         "time_epsilon": solver.time_epsilon,
         "max_velocity_norm": solver.max_velocity_norm,
+        "velocity_scale": getattr(solver, "velocity_scale", "current"),
         **overrides,
     }
 
